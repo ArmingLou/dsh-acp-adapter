@@ -13,6 +13,30 @@ const SESSION = 'qwen-session'
 const tasks = [{ kind: 'shell', id: 'bg-1', label: 'sleep 1 && echo done', status: 'running', startTime: 1 }]
 const cancelled = []
 let backgroundTurn
+let activeWorkSeq = 0
+let activeWorkEnabled = false
+let cronActive = false
+let cronCancelled = false
+const activeWork = () => {
+  if (!activeWorkEnabled) return
+  send({
+    jsonrpc: '2.0',
+    method: 'qwen/notify/channel/active-work',
+    params: {
+      v: 1,
+      seq: ++activeWorkSeq,
+      sessions: [
+        {
+          sessionId: SESSION,
+          holds:
+            cronActive && process.env.FAKE_QWEN_IDLE_ONLY !== '1'
+              ? [{ category: 'session', id: 'session:active-turn' }]
+              : [],
+        },
+      ],
+    },
+  })
+}
 const send = (message) => process.stdout.write(`${JSON.stringify(message)}\n`)
 const request = (method, params) =>
   new Promise((resolve) => {
@@ -90,9 +114,17 @@ async function runBackground(withQuestion) {
   if (!proceed) return
   const meta = { backgroundTurn: { turnId, taskId: 'bg-1', kind: 'shell' } }
   backgroundTurn = { turnId, ended: false }
+  if (process.env.FAKE_QWEN_IGNORE_CANCEL === '1') {
+    text('background still running', meta)
+    setTimeout(() => text('late background output', meta), 200)
+    return
+  }
   if (withQuestion) {
     const response = await ask(meta)
     text(`bg-answers:${JSON.stringify(response?.result?.answers ?? null)}`, meta)
+  }
+  if (process.env.FAKE_QWEN_BACKGROUND_FS === '1') {
+    void request('fs/write_text_file', { sessionId: SESSION, path: '/fixture/output.txt', content: 'result' })
   }
   await new Promise((resolve) => setTimeout(resolve, 20))
   if (backgroundTurn.ended) return
@@ -101,14 +133,22 @@ async function runBackground(withQuestion) {
   send({
     jsonrpc: '2.0',
     method: '_qwencode/end_turn',
-    params: { sessionId: SESSION, reason: 'end_turn', turnId, source: 'background_notification' },
+    params: {
+      sessionId: SESSION,
+      reason: process.env.FAKE_QWEN_END_REASON ?? 'end_turn',
+      turnId,
+      source: 'background_notification',
+    },
   })
 }
 
 // Qwen cron/loop turn: no start/end markers, only the echoed prompt and
 // usage chunks closing each model round.
-async function runCron(respond) {
+async function runCron(respond, slowHook = false) {
   if (respond === undefined) await new Promise((resolve) => setTimeout(resolve, 100))
+  cronActive = true
+  cronCancelled = false
+  activeWork()
   const usage = () =>
     update({
       sessionUpdate: 'agent_message_chunk',
@@ -122,6 +162,44 @@ async function runCron(respond) {
   })
   text('cron working')
   usage()
+  if (process.env.FAKE_QWEN_STALE_WORK === '1') {
+    send({
+      jsonrpc: '2.0',
+      method: 'qwen/notify/channel/active-work',
+      params: {
+        v: 1,
+        seq: activeWorkSeq,
+        sessions: [{ sessionId: SESSION, holds: [] }],
+      },
+    })
+    send({
+      jsonrpc: '2.0',
+      method: 'qwen/notify/channel/active-work',
+      params: {
+        v: 1,
+        seq: activeWorkSeq + 1000,
+        sessions: [{ sessionId: SESSION, holds: 'malformed' }],
+      },
+    })
+  }
+  if (process.env.FAKE_QWEN_FAST_CRON === '1') {
+    text('cron done')
+    cronActive = false
+    activeWork()
+    return
+  }
+  if (slowHook) {
+    // Real Qwen emits usage before runToolCalls, whose PreToolUse hook and
+    // permission happen before emitStart. No wire update is owed by the hook.
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    if (cronCancelled) return
+    const permission = await request('session/request_permission', {
+      sessionId: SESSION,
+      toolCall: { toolCallId: 'cron-tool', title: 'Run build', kind: 'execute', status: 'pending' },
+      options: [{ optionId: 'allow', kind: 'allow_once', name: 'Allow' }],
+    })
+    text(`cron-permission:${permission?.result?.outcome?.outcome ?? 'missing'}`)
+  }
   // "schedule-inline": Qwen drains cron before answering the prompt.
   respond?.()
   update({
@@ -134,10 +212,14 @@ async function runCron(respond) {
   })
   update({ sessionUpdate: 'tool_call_update', toolCallId: 'cron-tool', status: 'in_progress' })
   await new Promise((resolve) => setTimeout(resolve, 300))
+  if (cronCancelled) return
   update({ sessionUpdate: 'tool_call_update', toolCallId: 'cron-tool', status: 'completed' })
   await new Promise((resolve) => setTimeout(resolve, 200))
+  if (cronCancelled) return
   text('cron done')
   usage()
+  cronActive = false
+  activeWork()
 }
 
 async function onPrompt(message) {
@@ -151,6 +233,11 @@ async function onPrompt(message) {
     return
   }
   text(`echo:${prompt}`)
+  if (prompt.includes('ordinary-metadata'))
+    text('ordinary background-shaped answer', {
+      source: 'background_task_completed',
+      backgroundTask: { taskId: 'ordinary', status: 'completed' },
+    })
   if (prompt.includes('schedule-inline')) {
     void runCron(() => send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } }))
     return
@@ -176,8 +263,9 @@ async function onPrompt(message) {
       },
     },
   })
-  if (prompt.includes('background')) void runBackground(prompt.includes('background-ask'))
-  if (prompt.includes('schedule')) void runCron()
+  if (prompt.includes('background') && tasks[0].status === 'running')
+    void runBackground(prompt.includes('background-ask'))
+  if (prompt.includes('schedule')) void runCron(undefined, prompt.includes('slow-hook'))
 }
 
 process.stdin.on('data', (chunk) => {
@@ -196,13 +284,20 @@ process.stdin.on('data', (chunk) => {
     }
     switch (message.method) {
       case 'initialize':
+        activeWorkEnabled =
+          process.env.FAKE_QWEN_NO_ACTIVE_WORK !== '1' &&
+          message.params._meta?.['qwen.daemon.activeWorkHeartbeat']?.v === 1
+        if (activeWorkEnabled && process.env.FAKE_QWEN_IDLE_ONLY === '1') setInterval(activeWork, 20).unref()
         send({
           jsonrpc: '2.0',
           id: message.id,
           result: {
             protocolVersion: 1,
-            agentInfo: { name: 'qwen-code', title: 'Qwen Code', version: '0.25.1' },
+            agentInfo: { name: process.env.FAKE_QWEN_AGENT_NAME ?? 'qwen-code', title: 'Qwen Code', version: '0.25.1' },
             agentCapabilities: { loadSession: true },
+            ...(activeWorkEnabled
+              ? { _meta: { 'qwen.daemon.activeWorkHeartbeat': { v: 1, intervalMs: 5000, categories: ['session'] } } }
+              : {}),
           },
         })
         break
@@ -213,6 +308,12 @@ process.stdin.on('data', (chunk) => {
         void onPrompt(message)
         break
       case 'session/cancel':
+        if (process.env.FAKE_QWEN_IGNORE_CANCEL === '1') break
+        if (cronActive) {
+          cronCancelled = true
+          cronActive = false
+          activeWork()
+        }
         if (backgroundTurn !== undefined && !backgroundTurn.ended) {
           backgroundTurn.ended = true
           send({

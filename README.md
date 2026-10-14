@@ -6,7 +6,7 @@
 
 ## 安装
 
-当前插件版本 [`0.2.0-rc.2.9`](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/tag/v0.2.0-rc.2.9) 兼容 DSH `0.2.0-rc.2`。其他版本见 [Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases)。
+当前插件版本 [`0.2.0-rc.2.10`](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/tag/v0.2.0-rc.2.10) 兼容 DSH `0.2.0-rc.2`。其他版本见 [Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases)。
 
 **推荐：** 在 DSH Creator 模式中发送：
 
@@ -33,10 +33,10 @@ Git 与压缩包安装示例：
 
 在插件管理器中，可将下方 Git 地址或 .tgz 包 URL 替换包名粘贴到输入框中。
 
-| 来源              | 示例                                                                                                                                                   |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Git               | `git+https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter.git#v0.2.0-rc.2.9`                                                                         |
-| 预构建插件包 .tgz | [下载 0.2.0-rc.2.9](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/download/v0.2.0-rc.2.9/zaimokuza-dsh-acp-adapter-0.2.0-rc.2.9.tgz) |
+| 来源              | 示例                                                                                                                                                      |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git               | `git+https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter.git#v0.2.0-rc.2.10`                                                                           |
+| 预构建插件包 .tgz | [下载 0.2.0-rc.2.10](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/download/v0.2.0-rc.2.10/zaimokuza-dsh-acp-adapter-0.2.0-rc.2.10.tgz) |
 
 此包包含编译产物，与 npm 发布包一致。GitHub 自动生成的 Source code ZIP/TAR.GZ 是源码归档，不是构建后的插件包；未缓存的依赖仍需联网安装。
 
@@ -56,8 +56,6 @@ Git 与压缩包安装示例：
 | Claude                     | `claude-agent-acp`                       | `claude`           |
 | Codex                      | `codex-acp`                              | `codex login`      |
 | Kimi                       | `kimi acp`                               | `kimi login`       |
-
-Antigravity 的本机检查使用官方 raw ACP server 1.3.0，覆盖原生权限问答、工具审批和同会话续聊，以及 DSH MCP 工具续聊。Antigravity 应用认证与 ACP 账号彼此独立，插件不迁移登录状态；wrapper、Teams 和 Windows 尚未验收。具体范围见下方的 E2E 验证记录。
 
 > CodeBuddy CLI 与 WorkBuddy 桌面端使用同一账号积分，无需分别订阅；通过 CodeBuddy CLI 接入 DSH。详见 [CodeBuddy 账号与订阅说明](https://www.codebuddy.cn/docs/ide/Account/pricing)及 [ACP 命令参考](https://www.codebuddy.cn/docs/cli/cli-reference)。
 

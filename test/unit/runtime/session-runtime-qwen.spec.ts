@@ -106,6 +106,28 @@ function recordingJobs(): { starter: QwenTaskJobStarter; jobs: RecordedJob[]; ne
 }
 
 describe('Qwen Code ask_user_question', () => {
+  it('leaves an ordinary Agent question and background-shaped content on the generic paths', async () => {
+    let approvals = 0
+    const runtime = createRuntime(
+      {
+        qwenTaskJobs: recordingJobs().starter,
+        onPermissionRequest: async () => {
+          approvals++
+          return { outcome: { outcome: 'selected', optionId: 'proceed_once' } }
+        },
+        onQwenQuestion: async () => {
+          throw new Error('not Qwen')
+        },
+      },
+      { FAKE_QWEN_AGENT_NAME: 'ordinary-agent' },
+    )
+    const updates: AcpSessionNotification[] = []
+    await runtime.prompt([{ type: 'text', text: 'ask' }], (n) => updates.push(n))
+    expect(approvals).toBe(1)
+    expect(texts(updates)).toContain('answers:null outcome:{"outcome":"selected","optionId":"proceed_once"}')
+    await runtime.prompt([{ type: 'text', text: 'ordinary-metadata' }], (n) => updates.push(n))
+    expect(texts(updates)).toContain('ordinary background-shaped answer')
+  })
   it('answers through the native question card with Qwen `answers`, never through approval', async () => {
     const runtime = createRuntime()
     const updates: AcpSessionNotification[] = []
@@ -137,6 +159,181 @@ describe('Qwen Code ask_user_question', () => {
 })
 
 describe('Qwen Code background tasks', () => {
+  it('settles a fast cron from ordered activity snapshots without needing a quiet timer', async () => {
+    const jobs = recordingJobs()
+    const runtime = createRuntime({ qwenTaskJobs: jobs.starter }, { FAKE_QWEN_FAST_CRON: '1' })
+    await runtime.prompt([{ type: 'text', text: 'schedule' }], () => undefined)
+    await expect.poll(() => jobs.jobs.some((job) => job.label.startsWith('cron:'))).toBe(true)
+    const updates: AcpSessionNotification[] = []
+    const response = await runtime.prompt(
+      [{ type: 'text', text: 'wake' }],
+      (n) => updates.push(n),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { adoptAgentTurn: true },
+    )
+    expect(response.stopReason).toBe('end_turn')
+    expect(texts(updates)).toEqual(expect.arrayContaining(['cron working', 'cron done']))
+    expect(texts(updates).some((text) => text.startsWith('echo:'))).toBe(false)
+  })
+
+  it('uses a confirmed cron release on Stop and never dispatches retained input', async () => {
+    const jobs = recordingJobs()
+    const runtime = createRuntime({ qwenTaskJobs: jobs.starter, cancelGraceMs: 100 })
+    await runtime.prompt([{ type: 'text', text: 'schedule' }], () => undefined)
+    await expect.poll(() => jobs.jobs.some((job) => job.label.startsWith('cron:'))).toBe(true)
+    const controller = new AbortController()
+    const updates: AcpSessionNotification[] = []
+    const adopted = runtime.prompt(
+      [{ type: 'text', text: 'wake' }],
+      (n) => updates.push(n),
+      controller.signal,
+      undefined,
+      undefined,
+      undefined,
+      { adoptAgentTurn: true, followupContent: [{ type: 'text', text: 'must not dispatch' }] },
+    )
+    setTimeout(() => controller.abort(), 10)
+    expect((await adopted).stopReason).toBe('cancelled')
+    expect(texts(updates).some((text) => text.includes('must not dispatch'))).toBe(false)
+    expect((await runtime.prompt([{ type: 'text', text: 'next user' }], () => undefined)).stopReason).toBe('end_turn')
+  })
+
+  it.each(['FAKE_QWEN_NO_ACTIVE_WORK', 'FAKE_QWEN_IDLE_ONLY'])(
+    'fails unknown rather than succeeding or waiting forever without activity proof (%s)',
+    async (envKey) => {
+      const jobs = recordingJobs()
+      const runtime = createRuntime({ qwenTaskJobs: jobs.starter, unannouncedIdleMs: 120 }, { [envKey]: '1' })
+      await runtime.prompt([{ type: 'text', text: 'schedule' }], () => undefined)
+      await expect.poll(() => jobs.jobs.some((job) => job.label.startsWith('cron:'))).toBe(true)
+      const updates: AcpSessionNotification[] = []
+      await expect(
+        runtime.prompt(
+          [{ type: 'text', text: 'wake' }],
+          (n) => updates.push(n),
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          { adoptAgentTurn: true, followupContent: [{ type: 'text', text: 'must not dispatch' }] },
+        ),
+      ).rejects.toThrow()
+      expect(texts(updates).some((text) => text.includes('must not dispatch'))).toBe(false)
+    },
+  )
+
+  it('drains adopted native Host operations before sending retained input in order', async () => {
+    const jobs = recordingJobs()
+    let releaseWrite!: () => void
+    let startedWrite!: () => void
+    const writeStarted = new Promise<void>((resolve) => {
+      startedWrite = resolve
+    })
+    const writeDone = new Promise<void>((resolve) => {
+      releaseWrite = resolve
+    })
+    const runtime = createRuntime(
+      {
+        qwenTaskJobs: jobs.starter,
+        createFileSystemHandlers: () => ({
+          dispose: () => undefined,
+          readTextFile: async () => ({ content: '' }),
+          writeTextFile: async () => {
+            startedWrite()
+            await writeDone
+            return {}
+          },
+        }),
+      },
+      { FAKE_QWEN_BACKGROUND_FS: '1' },
+    )
+    const mirrored = jobs.next()
+    await runtime.prompt([{ type: 'text', text: 'background' }], () => undefined)
+    await (
+      await mirrored
+    ).outcome
+    const updates: AcpSessionNotification[] = []
+    let settled = false
+    const adopted = runtime
+      .prompt([{ type: 'text', text: 'wake' }], (n) => updates.push(n), undefined, undefined, undefined, undefined, {
+        adoptAgentTurn: true,
+        followupContent: [{ type: 'text', text: 'retained input' }],
+      })
+      .finally(() => {
+        settled = true
+      })
+    await writeStarted
+    await expect.poll(() => texts(updates)).toContain('The background command printed done.')
+    expect(settled).toBe(false)
+    expect(texts(updates)).not.toContain('echo:retained input')
+    releaseWrite()
+    expect((await adopted).stopReason).toBe('end_turn')
+    expect(texts(updates)).toContain('echo:retained input')
+    expect(texts(updates).indexOf('The background command printed done.')).toBeLessThan(
+      texts(updates).indexOf('echo:retained input'),
+    )
+  })
+
+  it('rejects an unconfirmed Stop and refuses to reuse the live automatic turn', async () => {
+    const jobs = recordingJobs()
+    const runtime = createRuntime({ qwenTaskJobs: jobs.starter, cancelGraceMs: 40 }, { FAKE_QWEN_IGNORE_CANCEL: '1' })
+    const mirrored = jobs.next()
+    await runtime.prompt([{ type: 'text', text: 'background' }], () => undefined)
+    await (
+      await mirrored
+    ).outcome
+    const controller = new AbortController()
+    const updates: AcpSessionNotification[] = []
+    const adopted = runtime.prompt(
+      [{ type: 'text', text: 'wake' }],
+      (n) => updates.push(n),
+      controller.signal,
+      undefined,
+      undefined,
+      undefined,
+      { adoptAgentTurn: true, followupContent: [{ type: 'text', text: 'must not dispatch' }] },
+    )
+    setTimeout(() => controller.abort(), 10)
+    await expect(adopted).rejects.toThrow()
+    await expect(runtime.prompt([{ type: 'text', text: 'next user' }], () => undefined)).rejects.toThrow()
+    expect(jobs.jobs).toHaveLength(1)
+    expect(texts(updates).some((text) => text.includes('must not dispatch'))).toBe(false)
+  })
+
+  it('keeps a cron round active through a slow pre-tool hook and its later permission', async () => {
+    const jobs = recordingJobs()
+    let approvals = 0
+    const runtime = createRuntime(
+      {
+        qwenTaskJobs: jobs.starter,
+        onPermissionRequest: async () => {
+          approvals++
+          return { outcome: { outcome: 'selected', optionId: 'allow' } }
+        },
+      },
+      { FAKE_QWEN_STALE_WORK: '1' },
+    )
+    await runtime.prompt([{ type: 'text', text: 'schedule-slow-hook' }], () => undefined)
+    await expect.poll(() => jobs.jobs.find((job) => job.label.startsWith('cron:'))).toBeDefined()
+    const updates: AcpSessionNotification[] = []
+    const response = await runtime.prompt(
+      [{ type: 'text', text: 'wake' }],
+      (n) => updates.push(n),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { adoptAgentTurn: true },
+    )
+    expect(response.stopReason).toBe('end_turn')
+    expect(approvals).toBe(1)
+    expect(texts(updates)).toContain('cron-permission:selected')
+    expect(texts(updates)).toContain('cron done')
+    expect(jobs.jobs).toHaveLength(2) // one mirrored shell + one cron wake, never a split cron
+  })
+
   it('mirrors running tasks as jobs and adopts the Qwen-initiated turn after the wake-up', async () => {
     const jobs = recordingJobs()
     const runtime = createRuntime({ qwenTaskJobs: jobs.starter })
@@ -226,7 +423,7 @@ describe('Qwen Code background tasks', () => {
 
   it('adopts an unannounced Qwen cron turn and ends it after a tool-free round', async () => {
     const jobs = recordingJobs()
-    const runtime = createRuntime({ qwenTaskJobs: jobs.starter, unannouncedRoundGraceMs: 400 })
+    const runtime = createRuntime({ qwenTaskJobs: jobs.starter })
     const wake = new Promise<RecordedJob>((resolve) => {
       const poll = setInterval(() => {
         const job = jobs.jobs.find((candidate) => candidate.label.startsWith('cron:'))
@@ -265,7 +462,7 @@ describe('Qwen Code background tasks', () => {
 
   it('splits a cron turn that Qwen starts before answering the current prompt', async () => {
     const jobs = recordingJobs()
-    const runtime = createRuntime({ qwenTaskJobs: jobs.starter, unannouncedRoundGraceMs: 400 })
+    const runtime = createRuntime({ qwenTaskJobs: jobs.starter })
     const first: AcpSessionNotification[] = []
     await runtime.prompt([{ type: 'text', text: 'schedule-inline' }], (notification) => {
       first.push(notification)

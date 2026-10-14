@@ -22,6 +22,7 @@ import type {
   LlmResolvedModelInfo,
   ResolvedRetryPolicy,
   StreamChunk,
+  UserMessage,
 } from '@deepseek-ai/dsh-llm'
 import { AcpStubAdapter, reasoningInfoFromConfigOptions } from './llm-stub.ts'
 import type { AcpProbeCacheEntry } from './llm-stub.ts'
@@ -69,6 +70,8 @@ import type { AcpSessionForkReason, AcpTerminalAuditData } from '../../domain/po
 import { isSensitiveActivityField, redactSecretText } from '../../domain/observability/redaction.ts'
 import { hostSystemPrompt } from '../../domain/session/host-system-prompt.ts'
 import { AcpPromptContentError, skillRouteForTools, toAcpPrompt } from '../../domain/session/prompt-content.ts'
+import { currentModelContextSnapshots } from '../../domain/session/model-context-snapshots.ts'
+import { generatedContextBlock } from '../../runtime/text-block-boundary.ts'
 import { createAcpFileSystemHandlers } from '../../runtime/client-capabilities/filesystem.ts'
 import { createAcpTerminalHandlers } from '../../runtime/client-capabilities/terminal.ts'
 import type { AcpTerminalJobStarter } from '../../runtime/client-capabilities/terminal-job.ts'
@@ -686,23 +689,51 @@ export interface AcpProfileRuntime {
 }
 
 /**
- * A step woken only by native completion notices for mirrored Qwen tasks:
- * Qwen is already running that turn by itself, so the provider call adopts
- * it instead of sending the notice as a new prompt.
+ * Separate native Qwen job wake notices from the rest of an admitted step.
+ * A mixed step still has to adopt Qwen's already-running turn before sending
+ * its other messages; switching straight to session/prompt would overlap it.
  */
-export function isQwenTaskWakeStep(messages: readonly import('@deepseek-ai/dsh-llm').UserMessage[]): boolean {
-  if (messages.length === 0) return false
-  let notice = false
+export function qwenTaskWakeInput(messages: readonly UserMessage[]): readonly UserMessage[] | undefined {
+  const remaining: UserMessage[] = []
+  let wake = false
   for (const message of messages) {
     const source = message.source as { readonly kind?: unknown }
-    if (source.kind === 'user') return false
-    if (
-      source.kind === 'tool-jobs' &&
-      message.content.some((block) => block.type === 'text' && block.text.includes(`(${QWEN_TASK_JOB_KIND}:`))
-    )
-      notice = true
+    const content = message.content.filter((block) => {
+      const notice =
+        source.kind === 'tool-jobs' &&
+        block.type === 'text' &&
+        new RegExp(`^background job ${QWEN_TASK_JOB_KIND}-\\d+(?:[\\s(]|$)`).test(block.text)
+      wake ||= notice
+      return !notice
+    })
+    if (content.length !== 0)
+      remaining.push(content.length === message.content.length ? message : { ...message, content })
   }
-  return notice
+  return wake ? remaining : undefined
+}
+
+export function isQwenTaskWakeStep(messages: readonly UserMessage[]): boolean {
+  return qwenTaskWakeInput(messages) !== undefined
+}
+
+/** Only an identical, previously delivered native replacement can be omitted. */
+export function qwenTaskFollowupInput(
+  messages: readonly UserMessage[],
+  snapshots: readonly { readonly source: string; readonly text: string }[],
+  contextUnchanged: boolean,
+): readonly UserMessage[] {
+  if (!contextUnchanged) return messages
+  return messages.filter((message) => {
+    // Native producers extend MessageSourceMap from their own entry points;
+    // they need not be imported into the provider's production dependency graph.
+    const source: unknown = message.source
+    if (typeof source !== 'object' || source === null || !('kind' in source)) return true
+    const kind = source.kind
+    if (kind !== 'runtime-context' && kind !== 'skill-catalog') return true
+    if (message.content.some((block) => block.type !== 'text')) return true
+    const text = message.content.map((block) => (block.type === 'text' ? block.text : '')).join('\n')
+    return !snapshots.some((snapshot) => snapshot.source === kind && snapshot.text === text)
+  })
 }
 
 /** Host-owned DSH user-question seam resolved for the current DSH session. */
@@ -749,6 +780,10 @@ export class AcpProfileAdapter extends LlmAdapter {
   private readonly inMemoryRecoveryRequired = new Map<string, number>()
   private readonly inMemoryRecoveryStates = new Map<string, AcpRecoveryState>()
   private readonly sessionControlWrites = new Map<string, Promise<void>>()
+  private readonly deliveredQwenContexts = new WeakMap<
+    AcpProfileRuntime,
+    { readonly sessionId?: string; readonly key: string }
+  >()
 
   constructor(
     readonly profileId: string,
@@ -1898,6 +1933,9 @@ export class AcpProfileAdapter extends LlmAdapter {
       let terminalSettlementLifetime: (() => void) | undefined
       try {
         let validatedPrompt: acp.ContentBlock[]
+        let qwenPromptOptions: AcpPromptOptions = {}
+        let qwenContextKey: string | undefined
+        let qwenContextWillBeDelivered = true
         // Capability negotiation is deliberately before session/new, restore,
         // WAL, or prompt. Invalid/unsupported input therefore cannot create an
         // ACP session or a durable dispatch record.
@@ -1908,20 +1946,56 @@ export class AcpProfileAdapter extends LlmAdapter {
           // setup and makes a fork look like a blank session.
           if (runtime.initialize !== undefined) await runtime.initialize(options.signal)
           const modelContextSnapshots = session?.currentModelContextSnapshots?.()
-          const prompt = await toAcpPrompt(messages, {
+          const promptOptions = {
             system: hostSystemPrompt(options),
             ...(modelContextSnapshots === undefined ? {} : { modelContextSnapshots }),
             skillRoute: skillRouteForTools(options.tools),
             imageEnabled: runtime.agentCapabilities?.promptCapabilities?.image === true,
             ...(self.attachments === undefined ? {} : { attachments: self.attachments }),
             signal: options.signal ?? new AbortController().signal,
-          })
+          }
+          const prompt = await toAcpPrompt(messages, promptOptions)
           if (prompt.length === 0)
             throw new AcpPromptContentError(
               'dsh-acp: the claimed message(s) carry no supported content; nothing was sent to the ACP agent',
             )
           // Store the validated prompt for the dispatch path below.
           validatedPrompt = prompt
+          const snapshots = modelContextSnapshots ?? currentModelContextSnapshots(messages)
+          qwenContextKey = acpCanonicalHash16({
+            system: promptOptions.system,
+            skillRoute: promptOptions.skillRoute,
+            snapshots: snapshots.map(({ source, text }) => ({ source, text })),
+          })
+          const wakeInput = qwenTaskWakeInput(messages)
+          if (wakeInput !== undefined) {
+            const delivered = self.deliveredQwenContexts.get(runtime)
+            const contextUnchanged = delivered?.sessionId === runtime.acpSessionId && delivered?.key === qwenContextKey
+            let followup = qwenTaskFollowupInput(wakeInput, snapshots, contextUnchanged)
+            if (followup.length === 0 && !contextUnchanged) {
+              // A native snapshot can change without contributing a new message
+              // to this step. Carry its replacement as generated Host context,
+              // not as another task-completion notice.
+              followup = [
+                {
+                  ...messages[0]!,
+                  content: [
+                    {
+                      type: 'text',
+                      text: generatedContextBlock(
+                        'The host context has changed. Apply the current host instructions and context before continuing.',
+                      ),
+                    },
+                  ],
+                },
+              ]
+            }
+            qwenContextWillBeDelivered = followup.length !== 0
+            qwenPromptOptions = {
+              adoptAgentTurn: true,
+              ...(followup.length === 0 ? {} : { followupContent: await toAcpPrompt(followup, promptOptions) }),
+            }
+          }
         } catch (error: unknown) {
           await self.releaseRuntime(runtimeKey, runtime)
           if (error instanceof AcpPromptContentError) throw new LlmError(error.message, 'ACP_INPUT_NOT_SUPPORTED')
@@ -2857,6 +2931,10 @@ export class AcpProfileAdapter extends LlmAdapter {
           let segmentBoundaryIndex = nextContentIndex
           const applyProjectionAtDispatch = (): void => {
             projectedAtDispatch = true
+            // Steering may replace Host context again before this provider
+            // attempt settles. Do not certify its original context as current.
+            self.deliveredQwenContexts.delete(runtime)
+            qwenContextKey = undefined
             remoteCancellationHook = captureRemoteCancellationHook(nextProof)
             currentAnchor = nextProof!.anchorMessageId
             // A pending pull may contain the old segment's final text. It will
@@ -2933,7 +3011,7 @@ export class AcpProfileAdapter extends LlmAdapter {
           () => {
             if (successfulToolResultEligible) successfulToolResultConfirmed = true
           },
-          isQwenTaskWakeStep(messages) ? { adoptAgentTurn: true } : {},
+          qwenPromptOptions,
         )
         self.controlsChanged?.(sessionKey)
         const waitForKnownTerminalSettlement = async (): Promise<void> => {
@@ -2969,6 +3047,18 @@ export class AcpProfileAdapter extends LlmAdapter {
         ): Promise<void> => {
           remoteSettled = true
           stopWatchingInput?.()
+          if (
+            response.stopReason === 'end_turn' &&
+            !promptSignal.aborted &&
+            qwenContextWillBeDelivered &&
+            qwenContextKey !== undefined
+          )
+            self.deliveredQwenContexts.set(runtime, {
+              ...(runtime.acpSessionId === undefined ? {} : { sessionId: runtime.acpSessionId }),
+              key: qwenContextKey,
+            })
+          else if (response.stopReason !== 'end_turn' || promptSignal.aborted)
+            self.deliveredQwenContexts.delete(runtime)
           if (response.stopReason === 'cancelled') self.markConfirmedUserModeForRestore(sessionKey, runtime)
           const confirmedRemoteCancellation =
             response.stopReason === 'cancelled' &&
@@ -3224,6 +3314,7 @@ export class AcpProfileAdapter extends LlmAdapter {
         }
         const prompting = promptResult.then(handlePromptResponse, async (error: unknown) => {
           remoteSettled = true
+          self.deliveredQwenContexts.delete(runtime)
           stopWatchingInput?.()
           const settlementFailure = error instanceof AcpHostSettlementError ? error : undefined
           if (

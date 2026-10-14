@@ -71,6 +71,7 @@ import type {
   PermissionRequestHandler,
   QwenTurnEndParams,
   QwenTurnStartParams,
+  QwenActiveWorkSnapshot,
   SessionUpdateListener,
 } from './types.ts'
 
@@ -129,6 +130,49 @@ function qwenTurnEndParams(value: unknown): QwenTurnEndParams | undefined {
 
 function record(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+const QWEN_ACTIVE_WORK_META = 'qwen.daemon.activeWorkHeartbeat'
+const QWEN_ACTIVE_WORK_CATEGORIES = new Set(['agent', 'notification', 'shell', 'session', 'workflow', 'tool'])
+
+function qwenActiveWorkSnapshot(value: unknown): QwenActiveWorkSnapshot | undefined {
+  if (
+    !record(value) ||
+    value.v !== 1 ||
+    !Number.isSafeInteger(value.seq) ||
+    (value.seq as number) < 1 ||
+    !Array.isArray(value.sessions) ||
+    value.sessions.length > 1024
+  )
+    return undefined
+  const sessions: QwenActiveWorkSnapshot['sessions'][number][] = []
+  const seen = new Set<string>()
+  for (const session of value.sessions) {
+    if (
+      !record(session) ||
+      typeof session.sessionId !== 'string' ||
+      session.sessionId === '' ||
+      seen.has(session.sessionId) ||
+      !Array.isArray(session.holds) ||
+      session.holds.length > 1024
+    )
+      return undefined
+    const holds: { category: string; id: string }[] = []
+    for (const hold of session.holds) {
+      if (
+        !record(hold) ||
+        typeof hold.category !== 'string' ||
+        !QWEN_ACTIVE_WORK_CATEGORIES.has(hold.category) ||
+        typeof hold.id !== 'string' ||
+        hold.id === ''
+      )
+        return undefined
+      holds.push({ category: hold.category, id: hold.id })
+    }
+    seen.add(session.sessionId)
+    sessions.push({ sessionId: session.sessionId, holds })
+  }
+  return { v: 1, seq: value.seq as number, sessions }
 }
 
 /** Preserve standard ACP notifications plus the two negotiated Claude native
@@ -327,6 +371,7 @@ export class AcpClientConnection {
   private readonly command: string
   private readonly process: AcpAgentProcess
   private readonly conn: acp.ClientConnection
+  private readonly connectionFailure: Promise<never>
   private readonly clientInfo: acp.Implementation
   private readonly initializeTimeoutMs: number
   private readonly onPermissionRequest: PermissionRequestHandler | undefined
@@ -337,6 +382,8 @@ export class AcpClientConnection {
   private readonly onCapabilityDegraded: AcpConnectionOptions['onCapabilityDegraded']
   private readonly onQwenTurnStart: AcpConnectionOptions['onQwenTurnStart']
   private readonly onQwenTurnEnd: AcpConnectionOptions['onQwenTurnEnd']
+  private readonly onQwenActiveWork: AcpConnectionOptions['onQwenActiveWork']
+  private qwenWorkSnapshot: QwenActiveWorkSnapshot | undefined
   /** Sessions running an Agent-initiated turn (Qwen background/cron) that the
    * host has adopted; permission requests and host operations are valid there too. */
   private readonly agentTurnSessionIds = new Set<string>()
@@ -415,6 +462,7 @@ export class AcpClientConnection {
     this.onCapabilityDegraded = options.onCapabilityDegraded
     this.onQwenTurnStart = options.onQwenTurnStart
     this.onQwenTurnEnd = options.onQwenTurnEnd
+    this.onQwenActiveWork = options.onQwenActiveWork
     this.onProcessWarn = options.onProcessWarn ?? ((message) => console.error(message))
     if (options.onSessionUpdate !== undefined) this.updateListeners.add(options.onSessionUpdate)
 
@@ -438,6 +486,13 @@ export class AcpClientConnection {
       Readable.toWeb(this.process.stdout) as unknown as ReadableStream<Uint8Array>,
     )
     this.conn = this.buildClientApp().connect(stream)
+    this.connectionFailure = Promise.race([
+      this.process.failureArm,
+      this.conn.closed.then((): never => {
+        throw new AcpClientError('crash', `ACP agent "${this.command}" connection closed`)
+      }),
+    ])
+    void this.connectionFailure.catch(() => undefined)
   }
 
   /** 退出事实；进程仍在运行（或 spawn 失败从未存在）时为 null。 */
@@ -447,7 +502,29 @@ export class AcpClientConnection {
 
   /** Rejects once the Agent process fails or exits; never resolves. */
   get failed(): Promise<never> {
-    return this.process.failureArm
+    return this.connectionFailure
+  }
+
+  /** Negotiated reporting cadence; absent means session activity is not covered. */
+  get qwenActiveWorkIntervalMs(): number | undefined {
+    if (this.onQwenActiveWork === undefined || this.agentInfo?.name !== 'qwen-code') return undefined
+    const capability = this.negotiated?._meta?.[QWEN_ACTIVE_WORK_META]
+    if (
+      !record(capability) ||
+      capability.v !== 1 ||
+      !Array.isArray(capability.categories) ||
+      !capability.categories.includes('session') ||
+      typeof capability.intervalMs !== 'number' ||
+      !Number.isSafeInteger(capability.intervalMs) ||
+      capability.intervalMs < 5000 ||
+      capability.intervalMs > 60_000
+    )
+      return undefined
+    return capability.intervalMs
+  }
+
+  get qwenActiveWorkSnapshot(): QwenActiveWorkSnapshot | undefined {
+    return this.qwenWorkSnapshot
   }
 
   /** close 是否已发起。 */
@@ -784,6 +861,11 @@ export class AcpClientConnection {
     await Promise.all([...pending])
   }
 
+  /** An autonomous turn has the same admitted native FS/terminal tail as a wire prompt. */
+  async drainAgentTurnHostOperations(sessionId: string): Promise<void> {
+    await this.drainPromptHostOperations(sessionId)
+  }
+
   /** Mark an adopted Agent-initiated turn: it owns permission requests and
    * reopens the Host-operation generation like a prompt does. */
   setAgentTurnActive(sessionId: string, active: boolean): void {
@@ -964,6 +1046,12 @@ export class AcpClientConnection {
                 : {}),
             },
             clientInfo: this.clientInfo,
+            ...(this.onQwenActiveWork === undefined
+              ? {}
+              : {
+                  // A request for optional vendor reporting, never a standard client capability.
+                  _meta: { [QWEN_ACTIVE_WORK_META]: { v: 1, intervalMs: 5000, categories: ['session'] } },
+                }),
           }),
           this.process.failureArm,
         ]),
@@ -993,6 +1081,12 @@ export class AcpClientConnection {
         'Claude draft subagent notifications are unavailable with this ACP SDK; continuing with standard ACP capabilities',
       )
     }
+    // The SDK dispatches different notifications concurrently while traversing
+    // registered handlers. Put ordinary updates before vendor terminal markers
+    // so a same-frame end marker cannot overtake the preceding output chunk.
+    app.onNotification('session/update', ({ params }) => {
+      this.deliverSessionNotification(params)
+    })
     // Qwen Code announces background-notification turns with a private
     // request it waits on for at most ~2 s. Unregistered (no host seam) keeps
     // the SDK's -32601 answer, which Qwen treats as "run it anyway".
@@ -1028,11 +1122,25 @@ export class AcpClientConnection {
         },
       )
     }
+    if (this.onQwenActiveWork !== undefined) {
+      app.onNotification(
+        'qwen/notify/channel/active-work',
+        (params: unknown) => qwenActiveWorkSnapshot(params),
+        ({ params }) => {
+          if (
+            params === undefined ||
+            this.isClosed ||
+            this.qwenActiveWorkIntervalMs === undefined ||
+            params.seq <= (this.qwenWorkSnapshot?.seq ?? 0)
+          )
+            return
+          this.qwenWorkSnapshot = params
+          this.onQwenActiveWork?.(params)
+        },
+      )
+    }
     return (
       app
-        .onNotification('session/update', ({ params }) => {
-          this.deliverSessionNotification(params)
-        })
         .onRequest('session/request_permission', ({ params }) => {
           // Permission is a turn-scoped capability, not a connection-scoped UI
           // channel. Fail closed for initialize/idle requests and for a session
