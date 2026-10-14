@@ -6,7 +6,7 @@ Use ACP Agents in DSH with native sessions, tool approvals, and team collaborati
 
 ## Install
 
-Plugin version [`0.2.0-rc.2.9`](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/tag/v0.2.0-rc.2.9) supports DSH `0.2.0-rc.2`. See [Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases) for other versions.
+Plugin version [`0.2.0-rc.2.10`](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/tag/v0.2.0-rc.2.10) supports DSH `0.2.0-rc.2`. See [Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases) for other versions.
 
 **Recommended:** In DSH Creator mode, send:
 
@@ -31,10 +31,10 @@ npx @deepseek-ai/dsh@0.2.0-rc.2 plugin --profile web add @zaimokuza/dsh-acp-adap
 
 Git and archive examples. In the plugin manager, paste the Git address or .tgz URL below in place of the package name:
 
-| Source                         | Example                                                                                                                                                    |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Git                            | `git+https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter.git#v0.2.0-rc.2.9`                                                                             |
-| Prebuilt plugin archive (.tgz) | [Download 0.2.0-rc.2.9](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/download/v0.2.0-rc.2.9/zaimokuza-dsh-acp-adapter-0.2.0-rc.2.9.tgz) |
+| Source                         | Example                                                                                                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Git                            | `git+https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter.git#v0.2.0-rc.2.10`                                                                               |
+| Prebuilt plugin archive (.tgz) | [Download 0.2.0-rc.2.10](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases/download/v0.2.0-rc.2.10/zaimokuza-dsh-acp-adapter-0.2.0-rc.2.10.tgz) |
 
 This archive includes compiled output and matches the npm package. GitHub's automatically generated Source code ZIP/TAR.GZ files are source archives, not built plugin packages. Uncached dependencies still require network access.
 
@@ -54,8 +54,6 @@ The plugin ships with a snapshot of the [official ACP Agent catalog](https://age
 | Claude                    | `claude-agent-acp`                          | `claude`             |
 | Codex                     | `codex-acp`                                 | `codex login`        |
 | Kimi                      | `kimi acp`                                  | `kimi login`         |
-
-Antigravity's local checks use the official raw ACP server 1.3.0 and cover native permission questions, tool approvals and same-session continuation, plus DSH MCP continuation. Antigravity app authentication is separate from its ACP account; the plugin does not migrate sign-in state. The wrapper, Teams and Windows are not verified. See the E2E verification record below for scope.
 
 > CodeBuddy CLI and the WorkBuddy desktop app share account credits, with no separate subscription required. Connect DSH through the CodeBuddy CLI. See [CodeBuddy account and subscription details](https://www.codebuddy.cn/docs/ide/Account/pricing) and the [ACP CLI reference](https://www.codebuddy.cn/docs/cli/cli-reference).
 

@@ -37,6 +37,19 @@ Explicit Stop, rejected admission, a provider switch, or unloading terminates su
 
 Ordinary prompts remain mutually exclusive so one request cannot prematurely clear another's approval state. The Agent retains ownership of permissions, its model loop, compaction, and context. See the [E2E guide](../test/e2e/README.md) for verification methods.
 
+## Agent-initiated turns (Qwen Code)
+
+Qwen Code (`agentInfo.name === "qwen-code"`, with private protocol fields checked against the official 0.25.1 source) can start turns without a prompt: a background task finishes, or a `cron`/`loop` schedule fires. The adapter adopts these turns through native jobs and the DSH loop:
+
+- Running background tasks are read with `qwen/status/session/tasks` after each prompt and mirrored as DSH jobs (`acp-qwen-task`). Stopping the job calls `qwen/control/session/task/cancel`.
+- A completion with no running prompt settles the job without a waiter. DSH then wakes the idle agent through the normal jobs completion notice. That step adopts the turn that Qwen announces with `_qwencode/start_turn` and closes with `_qwencode/end_turn`; the notice is not sent as a new prompt.
+- Schedule turns have no announcement. They start at a `user_message_chunk` with `_meta.source` `cron` or `loop`; negotiated active-work snapshots confirm completion. Model usage and request-level lifecycle events do not finish the whole turn: tool hooks and approvals may still be pending. Without confirmable execution state, the outcome remains unknown rather than being inferred from silence. Output that Qwen streams before the prompt response is still moved to its own turn.
+- Other task notices and messages received in the same step are retained and sent in order after the automatic turn finishes, without dispatching a concurrent prompt to Qwen.
+- Permission requests and Host operations are accepted during an adopted turn, as during a prompt.
+- Questions from Qwen's `ask_user_question` arrive as permission requests with `_meta.qwenInteractionKind: "user_question"`. They are shown as DSH user questions, and the answers are returned in `answers`.
+
+Explicit Stop sends `session/cancel`, which also pauses Qwen notifications until the next user prompt. The adapter waits for remote completion confirmation. On timeout it closes the connection and uses the existing unknown-outcome recovery flow instead of treating a local timeout as confirmed cancellation. These are Qwen-private extensions; other Agents keep the behavior above. See the [E2E guide](../test/e2e/README.md) for separate fixture and real-Agent coverage.
+
 ## Official references
 
 - Codex: [input actions](https://developers.openai.com/codex/prompting#steering-and-queuing), [App Server](https://developers.openai.com/codex/app-server#steer-an-active-turn), [ACP idle fallback](https://github.com/agentclientprotocol/codex-acp/blob/2b48e9822330fc09f3a94a81563e5c4bb779601a/src/CodexAcpServer.ts#L1243).
