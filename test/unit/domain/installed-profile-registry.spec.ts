@@ -240,8 +240,8 @@ function fakeHarness(options: { failOnRoute?: string } = {}): FakeHarness {
       return () => listeners.delete(name)
     },
     get: (name: string): unknown => (name === 'settings' ? settings : undefined),
-    inject: (_deps: string[], callback: (sctx: unknown) => void): void => {
-      callback(scopedCtx)
+    inject: (deps: string[], callback: (sctx: unknown) => void): void => {
+      if (deps.every((name) => scopedCtx.get(name) !== undefined)) callback(scopedCtx)
     },
     effect: (_setup: () => () => void, _name?: string): void => {},
     llm,
@@ -717,6 +717,7 @@ describe('installInstalledProfileRegistry：注册/替换调用序列', () => {
       variables: { provider: 'acp-devin' },
     }))
     expect(result.contexts[0].text).toContain('wait for the host decision before proceeding')
+    expect(result.contexts[0].name).toBe('dsh-acp:delegation')
     expect(result.contexts.slice(1)).toEqual(original.contexts.slice(1))
     expect(original.contexts[0]!.text).toBe('native fixed delegation')
     expect(result.sections).toBe(original.sections)

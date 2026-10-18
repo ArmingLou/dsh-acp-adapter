@@ -11,7 +11,8 @@ import {
 } from '@deepseek-ai/dsh-session'
 import { createSessionFormatCatalogWithChildren } from '@deepseek-ai/dsh-session-format-catalog'
 import { releasedV3SessionFormatCodec } from '@deepseek-ai/dsh-session-format-v3-to-v4'
-import { snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
+import { foldSubagentDescriptor, SUBAGENT_DESCRIPTOR_VERSION } from '@deepseek-ai/dsh-subagent'
+import type { OneShotSubagentDescriptorData } from '@deepseek-ai/dsh-subagent'
 import type { AssistantMessage, UserMessage } from '@deepseek-ai/dsh-llm'
 import { AssistantStreamAccumulator } from '@deepseek-ai/dsh-llm'
 import { MessageId } from '@deepseek-ai/dsh-llm/brand'
@@ -198,7 +199,14 @@ function transcriptLog(
       type: 'subagent/descriptor',
       seq: SessionSeq(0),
       time: startedAt,
-      data: snapshotSubagentDescriptor({ mode: 'one-shot', provider: EXTERNAL_SUBAGENT_DESCRIPTOR_PROVIDER, label }),
+      // This is a read-only local transcript, not a resumable activation or an
+      // external catalog leaf. The released historical descriptor remains readable.
+      data: {
+        version: SUBAGENT_DESCRIPTOR_VERSION,
+        mode: 'one-shot',
+        provider: EXTERNAL_SUBAGENT_DESCRIPTOR_PROVIDER,
+        label,
+      } satisfies OneShotSubagentDescriptorData,
     },
     { type: 'turn/start', seq: SessionSeq(1), time: startedAt, data: { turn: 1 } },
     { type: 'step/start', seq: SessionSeq(2), time: startedAt, data: { turn: 1, step: 1 } },
@@ -219,6 +227,8 @@ function transcriptLog(
     { type: 'step/end', seq: SessionSeq(5), time: completedAt, data: { turn: 1, step: 1 } },
     { type: 'turn/end', seq: SessionSeq(6), time: completedAt, data: { turn: 1, reason: { kind: 'completed' } } },
   ]
+  if (foldSubagentDescriptor(events)?.mode !== 'one-shot')
+    throw new Error('ACP_SUBAGENT_TRANSCRIPT_INVALID: projected child must remain read-only')
   if (header.version === SESSION_FORMAT_VERSION) {
     const validated = Session.fromRestore(header.id, events, header, SessionLogOffset(0), 'detached')
     if (validated.deriveMessages().length !== 2)
@@ -365,12 +375,58 @@ export interface ExternalProjectionRepairSummary {
 
 /** Idempotent read-only transcript projection for evidence-complete external delegations. */
 export class ExternalSubagentProjector {
+  private accepting = true
+  private readonly pending = new Set<Promise<unknown>>()
+  private closing: Promise<void> | undefined
+
+  /** Stop new transactions and retain their dependencies through the final status write.
+   * @returns resolves after every accepted transaction and borrowed batch settles.
+   */
+  close(): Promise<void> {
+    this.accepting = false
+    return (this.closing ??= (async () => {
+      while (this.pending.size > 0) await Promise.allSettled([...this.pending])
+    })())
+  }
+
+  private run<T>(operation: () => Promise<T>): Promise<T> {
+    if (!this.accepting) return Promise.reject(new Error('ACP_SUBAGENT_PERSISTENCE_UNAVAILABLE'))
+    // Reserve ownership before synchronous staging can notify a reentrant disposer.
+    const completion = Promise.withResolvers<T>()
+    this.pending.add(completion.promise)
+    const release = (): void => {
+      this.pending.delete(completion.promise)
+    }
+    void completion.promise.then(release, release)
+    try {
+      void operation().then(completion.resolve, completion.reject)
+    } catch (error) {
+      completion.reject(error)
+    }
+    return completion.promise
+  }
+
   constructor(
     private readonly persistence: Pick<SessionPersistence, 'create' | 'open'>,
     private readonly sidecar: Pick<AcpSidecar, 'upsertActivity'> &
       Partial<Pick<AcpSidecar, 'listProjectedSubagentActivities'>>,
     private readonly publishChild?: (header: SessionHeader, label: string) => Promise<void>,
   ) {}
+
+  /** Borrow one admitted batch; shutdown waits through every transaction and caller writeback.
+   * @param operation - uses the supplied projector only within its awaited batch.
+   * @returns resolves after the batch and its final caller writeback settle.
+   */
+  withProjection(
+    operation: (
+      project: (
+        observation: ExternalDelegationObservation,
+        context: ExternalProjectionContext,
+      ) => Promise<ExternalProjectionResult | undefined>,
+    ) => Promise<void>,
+  ): Promise<void> {
+    return this.run(() => operation((observation, context) => this.projectAccepted(observation, context)))
+  }
 
   private async inspect(
     id: string,
@@ -426,7 +482,11 @@ export class ExternalSubagentProjector {
   }
 
   /** Converge interrupted projection transactions after the persistence seam mounts. */
-  async repairInterrupted(): Promise<ExternalProjectionRepairSummary> {
+  repairInterrupted(): Promise<ExternalProjectionRepairSummary> {
+    return this.run(() => this.repairAccepted())
+  }
+
+  private async repairAccepted(): Promise<ExternalProjectionRepairSummary> {
     const rows = (await this.sidecar.listProjectedSubagentActivities?.()) ?? []
     let committed = 0
     let repaired = 0
@@ -466,7 +526,14 @@ export class ExternalSubagentProjector {
     return { committed, repaired, conflicted }
   }
 
-  async project(
+  project(
+    observation: ExternalDelegationObservation,
+    context: ExternalProjectionContext,
+  ): Promise<ExternalProjectionResult | undefined> {
+    return this.run(() => this.projectAccepted(observation, context))
+  }
+
+  private async projectAccepted(
     observation: ExternalDelegationObservation,
     context: ExternalProjectionContext,
   ): Promise<ExternalProjectionResult | undefined> {

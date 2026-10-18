@@ -1,8 +1,10 @@
-export type AcpUiOutcome = 'saved' | 'save-failed' | 'deleted' | 'delete-failed'
+export type AcpUiOutcome =
+  'saved' | 'save-failed' | 'deleted' | 'delete-failed' | 'session-option-failed' | 'tool-approval-failed'
 
 export interface AcpUiOutcomeSnapshot {
   readonly outcome: AcpUiOutcome
   readonly sequence: number
+  readonly sourceSession?: { readonly id: string; readonly title: string | null }
 }
 
 /** One app-scoped outcome store read by the shell overlay and written by ACP surfaces. */
@@ -18,8 +20,8 @@ export class AcpUiFeedback {
     return () => this.listeners.delete(listener)
   }
 
-  readonly report = (outcome: AcpUiOutcome): void => {
-    this.snapshot = { outcome, sequence: ++this.sequence }
+  readonly report = (outcome: AcpUiOutcome, sourceSession?: AcpUiOutcomeSnapshot['sourceSession']): void => {
+    this.snapshot = { outcome, sequence: ++this.sequence, ...(sourceSession === undefined ? {} : { sourceSession }) }
     for (const listener of [...this.listeners]) listener()
   }
 

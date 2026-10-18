@@ -5,7 +5,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import type * as acp from '@agentclientprotocol/sdk'
 import { createUserMessage, LlmError, markAgentLoopRequest } from '@deepseek-ai/dsh-llm'
-import type { GenerateOptions } from '@deepseek-ai/dsh-llm'
+import type { GenerateOptions, UserMessage } from '@deepseek-ai/dsh-llm'
 import { AcpProfileAdapter } from '../../../src/host/composition/profile-adapter.ts'
 import type { AcpAgentConfig } from '../../../src/domain/session/agent-config.ts'
 import type { AcpProfileRuntime } from '../../../src/host/composition/profile-adapter.ts'
@@ -95,6 +95,133 @@ async function drain(iterable: AsyncIterable<unknown>): Promise<void> {
 }
 
 describe('M3a binding-first ACP provider', () => {
+  it('binds to the effective directory and blocks continuation or retry after cd without changing the project', async () => {
+    const { sidecar, root } = sidecarAt()
+    const origin = path.join(root, 'project')
+    const work = path.join(root, 'work')
+    const changed = path.join(root, 'changed')
+    for (const directory of [origin, work, changed]) fs.mkdirSync(directory)
+    let effective = work
+    const message = user('hello')
+    const live = withSessionFacts({
+      ...session(message),
+      header: { cwd: origin },
+      get workingDirectory() {
+        return effective
+      },
+    })
+    const records = { starts: 0, prompts: 0, restores: 0 }
+    const factory = vi.fn(runtimeFactory(records))
+    const adapter = new AcpProfileAdapter(
+      'test',
+      profile,
+      seam(),
+      () => live,
+      ledgerFor(sidecar),
+      undefined,
+      factory,
+      sidecar,
+    )
+    try {
+      await drain(adapter.stream(request('directory-binding', message)))
+      expect(factory.mock.calls[0]?.[0]).toMatchObject({ cwd: fs.realpathSync.native(work) })
+      const original = await sidecar.readLatestBinding('directory-binding' as never)
+      expect(original?.status === 'ok' && original.binding.canonicalCwd).toBe(fs.realpathSync.native(work))
+
+      effective = changed
+      await expect(drain(adapter.stream(request('directory-binding', message)))).rejects.toMatchObject({
+        code: 'ACP_RECONCILIATION_REQUIRED',
+      })
+      expect(records).toEqual({ starts: 1, prompts: 1, restores: 0 })
+      expect(await sidecar.readLatestBinding('directory-binding' as never)).toEqual(original)
+      expect(await sidecar.readRecoveryState('directory-binding' as never)).toMatchObject({ cause: 'cwd-changed' })
+      await expect(adapter.retryOriginal('directory-binding')).rejects.toMatchObject({
+        code: 'ACP_RECONCILIATION_REQUIRED',
+      })
+      expect(records.restores).toBe(0)
+      effective = work
+      await adapter.retryOriginal('directory-binding')
+      expect(records.restores).toBe(1)
+      expect(live.header.cwd).toBe(origin)
+    } finally {
+      await adapter.close()
+      await sidecar.dispose()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects a missing effective directory instead of launching in the immutable project origin', async () => {
+    const { sidecar, root } = sidecarAt()
+    const message = user('hello')
+    const live = withSessionFacts({ ...session(message), workingDirectory: undefined })
+    const factory = vi.fn(runtimeFactory({ starts: 0, prompts: 0, restores: 0 }))
+    const adapter = new AcpProfileAdapter(
+      'test',
+      profile,
+      seam(),
+      () => live,
+      ledgerFor(sidecar),
+      undefined,
+      factory,
+      sidecar,
+    )
+    try {
+      await expect(drain(adapter.stream(request('directory-missing', message)))).rejects.toMatchObject({
+        code: 'ACP_SESSION_CWD_UNAVAILABLE',
+      })
+      expect(factory).not.toHaveBeenCalled()
+      expect(await sidecar.readLatestBinding('directory-missing' as never)).toBeUndefined()
+    } finally {
+      await adapter.close()
+      await sidecar.dispose()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('blocks a directory change during capability negotiation before session creation or prompt dispatch', async () => {
+    const { sidecar, root } = sidecarAt()
+    const message = user('hello')
+    let effective = os.tmpdir()
+    const live = withSessionFacts({
+      ...session(message),
+      get workingDirectory() {
+        return effective
+      },
+    })
+    const start = vi.fn(async () => undefined)
+    const prompt = vi.fn(async () => ({ stopReason: 'end_turn' }) as never)
+    const adapter = new AcpProfileAdapter(
+      'test',
+      profile,
+      seam(),
+      () => live,
+      ledgerFor(sidecar),
+      undefined,
+      () => ({
+        initialize: async () => {
+          effective = root
+        },
+        start,
+        prompt,
+        close: async () => undefined,
+      }),
+      sidecar,
+    )
+    try {
+      await expect(drain(adapter.stream(request('directory-race', message)))).rejects.toMatchObject({
+        code: 'ACP_RECONCILIATION_REQUIRED',
+      })
+      expect(start).not.toHaveBeenCalled()
+      expect(prompt).not.toHaveBeenCalled()
+      expect(await sidecar.readLatestBinding('directory-race' as never)).toBeUndefined()
+      expect(await sidecar.readRecoveryState('directory-race' as never)).toMatchObject({ cause: 'cwd-changed' })
+    } finally {
+      await adapter.close()
+      await sidecar.dispose()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
   it('fails closed before any ACP runtime work when the sidecar is absent', async () => {
     const records = { starts: 0, prompts: 0, restores: 0 }
     const message = user('hello')
@@ -852,6 +979,158 @@ describe('M3a binding-first ACP provider', () => {
       const reboundBinding = await sidecar.readLatestBinding('rebind-session' as never)
       expect(reboundBinding?.status === 'ok' ? reboundBinding.binding.generation : undefined).toBe(2)
     } finally {
+      await sidecar.dispose()
+      fs.rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('restores projected DSH instructions to a blank remote session while retaining the same DSH history', async () => {
+    const { sidecar, root } = sidecarAt()
+    // This context plugin augments MessageSource only in the Host. Match the
+    // dynamic context-fixture boundary used by prompt-content.spec.ts.
+    const contextMessage = (message: unknown): UserMessage => message as UserMessage
+    const instruction = (text: string, baseline = false): UserMessage =>
+      contextMessage({
+        ...user(text),
+        source: {
+          kind: 'agent-instructions',
+          form: 'instructions',
+          changes: [],
+          ...(baseline ? { baseline: true } : {}),
+        },
+      })
+    const first = user('first task')
+    const baseline = instruction('original DSH workspace conventions', true)
+    const nested = instruction('nested scope instructions')
+    const changed = instruction('replacement workspace conventions')
+    const removed = instruction('nested instructions no longer apply')
+    const events: { type: string; data: unknown }[] = [
+      { type: 'step/start', data: { turn: 1, step: 0 } },
+      { type: 'user/message', data: first },
+      { type: 'user/message', data: baseline },
+      { type: 'user/message', data: nested },
+      { type: 'user/message', data: removed },
+    ]
+    const live = withSessionFacts({
+      header: { cwd: os.tmpdir() },
+      inheritedEventCount: 0,
+      snapshotEvents: () => [...events],
+    })
+    let turn = 1
+    const enter = (message: ReturnType<typeof user>) => {
+      events.push(
+        { type: 'step/end', data: { turn, step: 0 } },
+        { type: 'turn/end', data: { turn } },
+        { type: 'step/start', data: { turn: ++turn, step: 0 } },
+        { type: 'user/message', data: message },
+      )
+    }
+    const prompts: { remote: string; text: string[] }[] = []
+    let runtimeCount = 0
+    let failStart = false
+    const restore = vi.fn(async () => 'resumed' as const)
+    const createAdapter = () =>
+      new AcpProfileAdapter(
+        'test',
+        profile,
+        seam(),
+        () => live,
+        ledgerFor(sidecar),
+        undefined,
+        () => {
+          let remote = `remote-${String(++runtimeCount)}`
+          return {
+            get acpSessionId() {
+              return remote
+            },
+            initialize: async () => undefined,
+            start: async () => {
+              if (failStart) {
+                failStart = false
+                throw new Error('session/new was not dispatched')
+              }
+            },
+            restore: async (binding) => {
+              remote = binding.agentSessionId
+              return restore()
+            },
+            prompt: async (content, onUpdate) => {
+              prompts.push({
+                remote,
+                text: content.filter((block) => block.type === 'text').map((block) => block.text),
+              })
+              onUpdate({
+                sessionId: remote,
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } },
+              })
+              return { stopReason: 'end_turn' }
+            },
+            close: async () => undefined,
+          }
+        },
+        sidecar,
+      )
+    let adapter = createAdapter()
+    const send = (messages: GenerateOptions['messages']) =>
+      drain(
+        adapter.stream(
+          markAgentLoopRequest({
+            provider: 'acp-test',
+            model: 'model-a',
+            sessionId: 'instructions-rebind' as never,
+            messages,
+          }),
+        ),
+      )
+    try {
+      await send([first, baseline, nested, removed])
+      expect(prompts[0]?.text).toContain('original DSH workspace conventions')
+      const next = user('normal continuation')
+      enter(next)
+      await send([first, baseline, nested, removed, next])
+      expect(prompts[1]?.text).not.toContain('original DSH workspace conventions')
+      await adapter.close()
+      adapter = createAdapter()
+      const restored = user('continue after host restart')
+      enter(restored)
+      await send([first, baseline, nested, removed, next, restored])
+      expect(restore).toHaveBeenCalled()
+      expect(prompts[2]?.text).not.toContain('original DSH workspace conventions')
+
+      await adapter.rebindBlank('instructions-rebind')
+      const current = user('continue after blank rebind')
+      enter(current)
+      events.push({ type: 'user/message', data: changed })
+      const projected = [first, baseline, nested, removed, next, restored, current, changed]
+      const historyBefore = [...events]
+      failStart = true
+      await expect(send(projected)).rejects.toThrow('session/new was not dispatched')
+      expect((await sidecar.readRecoveryState('instructions-rebind' as never))?.lastUserAction).toBe('rebind-blank')
+      const promptsBefore = prompts.length
+      await send(projected)
+      expect(events).toEqual(historyBefore)
+      expect(prompts).toHaveLength(promptsBefore + 1)
+      const rebound = prompts.at(-1)!
+      expect(rebound.remote).not.toBe(prompts[0]?.remote)
+      expect(rebound.text[0]).toContain('Current host instructions')
+      expect(rebound.text[0]).toContain('No additional host instructions.')
+      expect(rebound.text.slice(1).filter((text) => text.trim() !== '')).toEqual([
+        'original DSH workspace conventions',
+        'nested scope instructions',
+        'nested instructions no longer apply',
+        'continue after blank rebind',
+        'replacement workspace conventions',
+      ])
+      expect(rebound.text).not.toContain('first task')
+      expect(rebound.text).not.toContain('normal continuation')
+      expect(rebound.text).not.toContain('continue after host restart')
+
+      const after = user('keep chatting in the rebound session')
+      enter(after)
+      await send([...projected, after])
+      expect(prompts.at(-1)?.text).not.toContain('original DSH workspace conventions')
+    } finally {
+      await adapter.close()
       await sidecar.dispose()
       fs.rmSync(root, { recursive: true, force: true })
     }

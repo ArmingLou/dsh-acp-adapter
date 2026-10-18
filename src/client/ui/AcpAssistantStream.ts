@@ -1,4 +1,14 @@
-import { createElement as h, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
+import {
+  createContext,
+  createElement as h,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react'
 import type { ComponentType, ReactNode } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type { StoredEntry, PropsRenderFactories } from '@deepseek-ai/dsh-client-ui-slots'
@@ -17,7 +27,6 @@ import type {
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import {
   ActivityRow,
-  completedProjectedChild,
   visibleActivityRows,
   activityJournalSessionId,
   renderNativeActivityTool,
@@ -34,10 +43,7 @@ import {
 } from './acp-chat-normalization.ts'
 export { activityBoundaries, finalAnswerStart } from './acp-chat-normalization.ts'
 
-type Dependencies = Pick<
-  ActivityNodeProps,
-  'journalHub' | 't' | 'onProjectedChild' | 'onOpenProjectedChild' | 'jsonStringWrapping'
->
+type Dependencies = Pick<ActivityNodeProps, 'journalHub' | 't' | 'onOpenProjectedChild' | 'jsonStringWrapping'>
 type NativeChatProps = ChatViewSlotProps & PropsRenderFactories
 
 class SnapshotSource<T> {
@@ -98,8 +104,23 @@ function groupSource(projection: ChatProjection, key: GroupKey) {
 const emptyChatSource = new SnapshotSource(null as unknown as ChatSnapshot)
 const emptyNodeSource = new SnapshotSource<ChatConversationViewNode | undefined>(undefined)
 const emptyProcessSource = new SnapshotSource<unknown>(undefined)
+const emptyBottomSource = new SnapshotSource(false)
 const emptyGroupSource = new SnapshotSource<GroupSnapshot<ConversationGroupData<'chat'>> | undefined>(undefined)
 const emptyGroupRevisionSource = new SnapshotSource(0)
+
+interface ProjectionBinding {
+  readonly projectionRef: { current: ChatProjection | undefined }
+  readonly projectionModeSource: SnapshotSource<number>
+}
+
+// One binding per rendered Chat view, including two viewports of the same Session.
+// Native flow entries inject their own sources, so root prop overrides alone do
+// not reach their keyed rows. Context crosses the complete native slot tree.
+const ProjectionContext = createContext<ProjectionBinding | undefined>(undefined)
+const emptyProjectionBinding: ProjectionBinding = {
+  projectionRef: { current: undefined },
+  projectionModeSource: emptyGroupRevisionSource,
+}
 
 export interface ChatProjectionChange {
   readonly nodes: ChatConversationViewNode[]
@@ -248,7 +269,6 @@ function NormalizedChat({
   const projectionModeRef = useRef<SnapshotSource<number> | undefined>(undefined)
   if (projectionModeRef.current === undefined) projectionModeRef.current = new SnapshotSource(0)
   const projectionModeSource = projectionModeRef.current
-  const nativePropsRef = useRef(props)
   const subscriptionsRef = useRef<ActivityAnchorSubscriptions | undefined>(undefined)
   if (subscriptionsRef.current === undefined) subscriptionsRef.current = new ActivityAnchorSubscriptions()
   const subscriptions = subscriptionsRef.current
@@ -295,10 +315,6 @@ function NormalizedChat({
           next.set(key, nextWindow)
           return next
         })
-        for (const row of rows) {
-          const child = completedProjectedChild(row)
-          if (child !== undefined) dependencies.onProjectedChild?.(child.parentSessionId, child.childSessionId)
-        }
       },
     )
   }, [signature, props.sessionId, dependencies, subscriptions])
@@ -319,7 +335,6 @@ function NormalizedChat({
     [projection, original, visibleWindows, props.sessionId],
   )
   useLayoutEffect(() => {
-    nativePropsRef.current = props
     if (projection !== undefined && change !== undefined) commitChatProjection(projection, change)
     if (projectionRef.current !== projection) {
       projectionRef.current = projection
@@ -327,7 +342,22 @@ function NormalizedChat({
       projectionModeSource.publish()
     }
   }, [projection, change, props])
-  const adapters = useMemo(() => {
+  const binding = useMemo(() => ({ projectionRef, projectionModeSource }), [])
+  const adapters = useProjectedChatHooks(props, binding)
+  return h(
+    ProjectionContext.Provider,
+    { value: binding },
+    h(Native, { ...props, ...adapters } as unknown as EntryProps),
+  )
+}
+
+/** Replace only Session data hooks; native viewport behavior stays on the flow. */
+function useProjectedChatHooks(props: NativeChatProps, { projectionRef, projectionModeSource }: ProjectionBinding) {
+  const nativePropsRef = useRef(props)
+  useLayoutEffect(() => {
+    nativePropsRef.current = props
+  }, [props])
+  return useMemo(() => {
     const useChat = (
       selector: (snapshot: ChatSnapshot) => unknown,
       equal?: (left: unknown, right: unknown) => boolean,
@@ -427,12 +457,24 @@ function NormalizedChat({
       const value = useSyncExternalStore(source.subscribe, source.getSnapshot)
       return projectionRef.current === undefined ? native : selector === undefined ? value : selector(value)
     }
-    return { useChat, useConversation, useChatNode, useChatNodeProcess, useChatGroup }
-  }, [])
-  return h(Native, {
-    ...props,
-    ...adapters,
-  } as unknown as EntryProps)
+    const useChatNodeBottom = (key: string) => {
+      const native = nativePropsRef.current.useChatNodeBottom(key)
+      useSyncExternalStore(projectionModeSource.subscribe, projectionModeSource.getSnapshot)
+      const source = projectionRef.current?.chatSource.getSnapshot().nodes.bottomSource(key) ?? emptyBottomSource
+      const value = useSyncExternalStore(source.subscribe, source.getSnapshot)
+      return projectionRef.current === undefined ? native : value
+    }
+    return { useChat, useConversation, useChatNode, useChatNodeBottom, useChatNodeProcess, useChatGroup }
+  }, [projectionRef, projectionModeSource])
+}
+
+function NormalizedChatFlow({ Native, props }: { Native: ComponentType<EntryProps>; props: EntryProps }): ReactNode {
+  const binding = useContext(ProjectionContext) ?? emptyProjectionBinding
+  // Subscribe at the bridge as well as in keyed hooks: the first projection is
+  // committed after render, and may not change the flow's owner entries.
+  useSyncExternalStore(binding.projectionModeSource.subscribe, binding.projectionModeSource.getSnapshot)
+  const adapters = useProjectedChatHooks(props as unknown as NativeChatProps, binding)
+  return h(Native, { ...props, ...adapters })
 }
 
 /** Shadow a native entry through the public slot API, preserving its full tree. */
@@ -488,6 +530,12 @@ export function installAcpAssistantStream(ctx: Context, dependencies: Dependenci
         ctx,
         dependencies,
       }),
+  )
+  composeSlot(
+    ctx,
+    'conversation.chat.flow',
+    () => true,
+    (Native, props) => h(NormalizedChatFlow, { Native, props }),
   )
   composeSlot(
     ctx,

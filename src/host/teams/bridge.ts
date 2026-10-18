@@ -53,7 +53,7 @@ function bridgeInstructions(names: ReadonlyMap<string, ToolDefinition>, hasTeams
     : names.has(RUN_CODE_NAME)
       ? `No direct DSH skill tool is listed. If DSH skill access is exposed through the generated SDK, call it inside "${RUN_CODE_NAME}" using the host-provided SDK instructions and listed schema; do not invent a direct skill tool.`
       : 'No DSH skill-loading entry point is listed. Do not claim DSH skill-catalog entries are available through an Agent-native skill tool; explain that this DSH connection has no listed skill entry point.'
-  return `These are native DSH tools available to this session. Use the exact tool names and schemas from tools/list. Tools and skills discovered in DSH context, including skill-catalog entries, must use this session's DSH MCP tools; do not route them through the Agent's native skill invocation or private skill directory, and do not copy DSH skill files into that directory. This does not replace or modify the Agent's own skills. Do not assume or expose tools or permissions absent from this DSH connection. ${skillRoute}${hasTeams ? ' Team tools require an explicit user request for a team; members share the workspace and only fresh context is supported.' : ''}`
+  return `These are native DSH tools available to this session. Use the exact tool names and schemas from tools/list. Tools and skills discovered in DSH context, including skill-catalog entries, must use this session's DSH MCP tools; do not route them through the Agent's native skill invocation or private skill directory, and do not copy DSH skill files into that directory. This does not replace or modify the Agent's own skills. Do not assume or expose tools or permissions absent from this DSH connection. ${skillRoute}${hasTeams ? ' Team members share the workspace and only fresh context is supported.' : ''}`
 }
 const isTeamTool = (name: string): boolean => (TEAM_TOOLS as readonly string[]).includes(name)
 const diagnosticTools = new Set<string>(TEAM_TOOLS)
@@ -93,7 +93,9 @@ function diagnosticInboxCounts(agent: NonNullable<ReturnType<typeof bridgeDefini
       const counts = { user: 0, 'team-message': 0, system: 0, other: 0 }
       for (const message of messages) {
         const kind = message.source?.kind
-        if (kind === 'user' || kind === 'team-message' || kind === 'system') counts[kind] += 1
+        // Keep the diagnostic wire bucket stable across the Host's mailbox → inbox migration.
+        if (isPendingPeerMessage(message)) counts['team-message'] += 1
+        else if (kind === 'user' || kind === 'system') counts[kind] += 1
         else counts.other += 1
       }
       return counts
@@ -118,6 +120,13 @@ function hasSourceKind(value: unknown, kind: string): boolean {
   if (typeof value !== 'object' || value === null || !('source' in value)) return false
   const source = (value as { readonly source?: unknown }).source
   return typeof source === 'object' && source !== null && 'kind' in source && source.kind === kind
+}
+/** Current Agent inbox relay attribution, plus already persisted Team mailbox messages. */
+function isPendingPeerMessage(value: unknown): boolean {
+  if (hasSourceKind(value, 'team-message')) return true
+  if (!hasSourceKind(value, 'agent-message')) return false
+  const source = (value as { readonly source: { readonly form?: unknown; readonly senderSessionId?: unknown } }).source
+  return source.form === 'relay' && typeof source.senderSessionId === 'string' && source.senderSessionId.length > 0
 }
 type FeedbackMessage = { readonly id?: unknown; readonly source?: unknown; readonly content?: unknown }
 type FeedbackAgent = NonNullable<ReturnType<typeof bridgeDefinitions>>['agent']
@@ -1043,9 +1052,7 @@ export async function createTeamBridge(
                 }
               : undefined
           if (diagnosticBase !== undefined) diagnosticHandlerBase = diagnosticBase
-          const queuedTeamMessage =
-            definition.name === 'wait_agent' &&
-            agent.inbox.nextStep.some((message) => hasSourceKind(message, 'team-message'))
+          const queuedTeamMessage = definition.name === 'wait_agent' && agent.inbox.nextStep.some(isPendingPeerMessage)
           if (queuedTeamMessage) {
             const text =
               'DSH_WAIT_DEFERRED_TEAM_MESSAGE: A Team message is already queued for this caller, so DSH did not execute wait_agent. End this ACP response now; DSH will deliver the queued message for you to handle.'
@@ -1085,13 +1092,15 @@ export async function createTeamBridge(
           }
           let result: Awaited<ReturnType<typeof tools.execute>>
           try {
-            result = await tools.execute({
-              callId: hostCallId as never,
-              name: definition.name,
-              arguments: args,
-              agent,
-              signal: bodySignal,
-            })
+            result = await agents.withInitiator(agent, () =>
+              tools.execute({
+                callId: hostCallId as never,
+                name: definition.name,
+                arguments: args,
+                agent,
+                signal: bodySignal,
+              }),
+            )
             if (toolErrorInfoCode(result.error) === TOOL_ABORTED_BEFORE_DISPATCH)
               callRecord.abortedBeforeDispatch = true
             if (diagnosticEnabled && diagnosticBase !== undefined) {
@@ -1310,7 +1319,7 @@ export async function createTeamBridge(
   const listeners: Array<() => unknown> = []
   const lease: AcpMcpLease = {
     signal: lifetime.signal,
-    instructions: `Current DSH tools connection: MCP server ${serverName}. ${scopedInstructions} Each session has its own connection and caller identity. Do not copy a connection address or server identity to another session.${hasTeams ? ' Team target names resolve within the caller’s Team. Create teams only when explicitly requested.' : ''} Pending DSH messages are delivered after you end the current response; give a brief progress update when asked to yield.`,
+    instructions: `Current DSH tools connection: MCP server ${serverName}. ${scopedInstructions} Each session has its own connection and caller identity. Do not copy a connection address or server identity to another session.${hasTeams ? ' Team target names resolve within the caller’s Team.' : ''} Pending DSH messages are delivered after you end the current response; give a brief progress update when asked to yield.`,
     servers,
     ...(diagnosticLeaseId === undefined ? {} : { diagnosticLeaseId }),
     beginPrompt(signal, reportCallback, promptOrdinal, concludedCallback, bodySignal, successfulToolResultCallback) {

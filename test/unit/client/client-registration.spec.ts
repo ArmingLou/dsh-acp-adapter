@@ -8,6 +8,7 @@ describe('client contribution', () => {
       'slots',
       'locale',
       'remote',
+      'remoteAccess',
       'sessions',
       'workspaces',
       'uiWorkspace',
@@ -40,7 +41,6 @@ describe('client contribution', () => {
         settings: { mutate: async () => ({ ok: true, value: null }) },
         dshAcp: {
           ownedProviderRoutes: async () => ({ ok: true, value: { providers: [] } }),
-          projectedSubagentIds: async () => ({ ok: true, value: { sessionIds: [] } }),
         },
       },
       uiSession: { sessionStatus: { getSnapshot: () => new Map(), subscribe: () => () => {} } },

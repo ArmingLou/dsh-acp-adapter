@@ -14,7 +14,7 @@ import type { ObservedEvent } from './types.ts'
 import type { AdapterWorld } from './scaffold.ts'
 import type { Page } from 'playwright'
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, readFileSync, existsSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdirSync, readFileSync, existsSync, writeFileSync, rmSync, realpathSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
@@ -290,6 +290,32 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
     }
   }
 
+  function regressionPrompts() {
+    return readFileSync(agentLog, 'utf8')
+      .split('\n')
+      .filter((line) => line.startsWith('[mock-agent scenario=regression] regression prompt='))
+  }
+
+  async function reloadWithoutDispatchOrReplay(sessionId: SessionId, markers: readonly string[]) {
+    const beforePrompts = regressionPrompts()
+    expect(beforePrompts.length).toBeGreaterThan(0)
+    const beforeEvents = JSON.stringify(events.filter((event) => event.sessionId === sessionId))
+    const beforeCounts = await Promise.all(markers.map((marker) => page.getByText(marker, { exact: true }).count()))
+    await page.reload()
+    for (const marker of markers) await page.getByText(marker, { exact: true }).first().waitFor()
+    // The native editor reflects a live, unlocked session and an idle input
+    // machine. An empty draft deliberately leaves its Send button disabled.
+    const input = page.locator('[data-composer-input][contenteditable="true"][data-phase="plain"]')
+    await input.waitFor({ state: 'visible' })
+    expect((await input.innerText()).trim()).toBe('')
+    expect(await page.getByRole('button', { name: 'Send message', exact: true }).isDisabled()).toBe(true)
+    expect(regressionPrompts()).toEqual(beforePrompts)
+    expect(JSON.stringify(events.filter((event) => event.sessionId === sessionId))).toBe(beforeEvents)
+    expect(await Promise.all(markers.map((marker) => page.getByText(marker, { exact: true }).count()))).toEqual(
+      beforeCounts,
+    )
+  }
+
   it('edits ACP configuration through the native bundle detail with validation, cancel and persisted save', async () => {
     let detail = await openAcpPluginDetail(page)
     await detail.getByRole('button', { name: 'Edit', exact: true }).click()
@@ -540,14 +566,68 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
       await panel.getByRole('button', { name: 'Refresh', exact: true }).click()
       await panel.getByText('Recovery status at last refresh', { exact: true }).waitFor()
       await panel.getByRole('status').locator('summary').click()
-      await panel.getByText('E2E_RECORDED_RECOVERY_CAUSE', { exact: true }).waitFor()
+      const rawDiagnostic = panel.getByText('E2E_RECORDED_RECOVERY_CAUSE', { exact: true })
+      await rawDiagnostic.waitFor()
+      const originalCodeSize = await page.evaluate(() =>
+        Number.parseFloat(getComputedStyle(document.body).getPropertyValue('--dsh-code-font-size')),
+      )
+      const originalScheme = await page.evaluate(() => document.documentElement.style.colorScheme)
+      try {
+        for (const theme of ['light', 'dark']) {
+          for (const size of [11, 16]) {
+            await host.ctx.settings.replace('ui-theme', {
+              preference: theme,
+              fontSize: 14,
+              codeFontSize: size,
+              codeFontFamily: 'monospace',
+            })
+            await expect.poll(() => page.evaluate(() => document.documentElement.style.colorScheme)).toBe(theme)
+            await expect
+              .poll(() =>
+                rawDiagnostic.evaluate((element) => {
+                  const style = getComputedStyle(element)
+                  return {
+                    size: style.fontSize,
+                    height: style.lineHeight,
+                    family: style.fontFamily.split(',').map((family) => family.trim().replace(/^["']|["']$/g, '')),
+                  }
+                }),
+              )
+              .toEqual({
+                size: `${size}px`,
+                height: `${size + 5}px`,
+                // Native code roles prepend the user's choice and retain the
+                // pinned theme's fallback stack, including its CJK families.
+                family: [
+                  'monospace',
+                  'SF Mono',
+                  'JetBrains Mono',
+                  'Fira Code',
+                  'Consolas',
+                  'Liberation Mono',
+                  'Menlo',
+                  'Courier',
+                  'PingFang SC',
+                  'Microsoft YaHei',
+                ],
+              })
+            expect(await panel.locator('table').evaluate((element) => getComputedStyle(element).fontSize)).toBe('12px')
+            expect(await panel.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1)
+          }
+          mkdirSync(join(root, '.local/ui-review'), { recursive: true })
+          await panel.screenshot({ path: join(root, `.local/ui-review/audit-code-font-${theme}-${profile}.png`) })
+        }
+      } finally {
+        await host.ctx.settings.replace('ui-theme', { preference: originalScheme, codeFontSize: originalCodeSize })
+      }
       expect(await panel.locator('tbody tr').count()).toBe(1)
       await sidecar.writeRecoveryState({ dshSessionId: id, kind: 'healthy', provider, updatedAt: Date.now() })
       await panel.getByRole('button', { name: 'Refresh', exact: true }).click()
       await panel.getByText('Recovery status at last refresh', { exact: true }).waitFor({ state: 'hidden' })
       expect(await panel.locator('tbody tr').count()).toBe(1)
       // Change the real host language, including the plugin's settings label.
-      await page.getByRole('button', { name: 'Settings', exact: true }).click()
+      await page.getByRole('button', { name: 'Account menu', exact: true }).click()
+      await page.getByRole('menuitem', { name: 'Settings', exact: true }).click()
       const settings = page.getByRole('dialog', { name: 'Settings', exact: true })
       await settings.getByRole('button', { name: 'General', exact: true }).click()
       await settings.getByRole('button', { name: 'English', exact: true }).click()
@@ -832,7 +912,9 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
       await handle.close()
     }
     await expandProcess()
-    const picture = page.locator('[data-variant] img')
+    // ACP's normalized Chat must retain the native Assistant image domain,
+    // including aliases declared by the composed native tree and its loader.
+    const picture = page.locator('[data-slot$="conversation.chat.message.images"] img')
     await picture.first().waitFor()
     await expect
       .poll(() =>
@@ -853,6 +935,11 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
       await host.ctx.settings.replace('locale', { preference: locale })
       await host.ctx.settings.replace('ui-theme', { preference: theme })
       await expect.poll(() => page.evaluate(() => document.documentElement.style.colorScheme)).toBe(theme)
+      await expect
+        .poll(() =>
+          picture.first().evaluate((img) => img instanceof HTMLImageElement && img.complete && img.naturalWidth > 0),
+        )
+        .toBe(true)
       for (const selector of ['[data-read]', '[data-diff]']) {
         const card = activity.locator(selector)
         const wrap = card.getByRole('button', { name: label, exact: true }).first()
@@ -862,6 +949,9 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
         await wrap.click()
         await expect.poll(() => wrap.getAttribute('aria-pressed')).toBe(previous)
       }
+      const evidence = join(root, '.local/rc1-native-images')
+      mkdirSync(evidence, { recursive: true })
+      await page.screenshot({ path: join(evidence, `${profile}-${theme}.png`), fullPage: true, animations: 'disabled' })
     }
     await host.ctx.settings.replace('locale', { preference: 'en' })
     await host.ctx.settings.replace('ui-theme', { preference: 'light' })
@@ -924,6 +1014,7 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
 
   it('presents ACP outputs through the native delivery card and preview, including after reload', async () => {
     writeFileSync(join(workspace, 'delivery.txt'), 'NATIVE_ACP_DELIVERY_CONTENT\n')
+    const deliveryPath = realpathSync(join(workspace, 'delivery.txt'))
     const { settled } = await send('E2E_PRESENT')
     const approval = page.locator('[data-question-key], [data-approval-key]')
     await approval.waitFor()
@@ -963,9 +1054,12 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
       await approval.getByRole('button', { name: /Submit|Send/ }).click()
     } else await approval.getByRole('button', { name: 'Allow once', exact: true }).click()
     const id = await settled
-    expect(
-      events.filter((event) => event.type === 'deliverables/presented').filter((event) => event.sessionId === id),
-    ).toHaveLength(1)
+    const deliveries = events
+      .filter((event) => event.type === 'deliverables/presented')
+      .filter((event) => event.sessionId === id)
+    expect(deliveries).toHaveLength(1)
+    expect(deliveries[0]?.data.files).toEqual([{ path: deliveryPath, description: 'ACP delivery through native DSH' }])
+    expect(readFileSync(deliveryPath, 'utf8')).toBe('NATIVE_ACP_DELIVERY_CONTENT\n')
     for (let round = 0; round < 2; round++) {
       if (round) await page.reload()
       const card = page.locator('[data-presented-file]').filter({ hasText: 'delivery.txt' })
@@ -1792,11 +1886,36 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
       expect(await panel.innerText()).not.toContain('The ACP Agent requests permission')
       expect(await panel.innerText()).not.toContain('ACP Agent 请求')
       await decide(allow)
-      await settled
+      const id = await settled
       await page.getByText(allow ? 'E2E_APPROVED' : 'E2E_DENIED', { exact: true }).waitFor()
       expect(existsSync(join(workspace, 'approval-marker.txt'))).toBe(allow)
       expect(readFileSync(agentLog, 'utf8')).toContain(`"optionId":"${allow ? 'permit-single' : 'deny-single'}"`)
       expect(await page.locator('[data-question-key], [data-approval-key]').count()).toBe(0)
+      if (!allow) {
+        const sidecar = createAcpSidecar({ root: required(host.ctx.dshHomePath)('dsh-acp') })
+        try {
+          const activityHead = await sidecar.activityHead(id)
+          const eventOffset = events.length
+          // This existing fixture returns only text, without an ACP tool update.
+          const next = await send('E2E_RECOVERED')
+          expect(await next.settled).toBe(id)
+          await page.getByText('E2E_RECOVERED_DONE', { exact: true }).waitFor()
+          expect(existsSync(join(workspace, 'approval-marker.txt'))).toBe(false)
+          expect(await sidecar.activityPage(id, activityHead)).toHaveLength(0)
+          expect(
+            events
+              .slice(eventOffset)
+              .filter(
+                (event) => event.sessionId === id && (event.type === 'tool/call' || event.type === 'tool/result'),
+              ),
+          ).toHaveLength(0)
+          await reloadWithoutDispatchOrReplay(id, ['E2E_DENIED', 'E2E_RECOVERED_DONE'])
+          expect(existsSync(join(workspace, 'approval-marker.txt'))).toBe(false)
+          expect(await page.locator('[data-question-key], [data-approval-key]').count()).toBe(0)
+        } finally {
+          await sidecar.dispose()
+        }
+      }
     } finally {
       await host.ctx.settings.replace('locale', { preference: 'en' })
     }
@@ -1805,12 +1924,37 @@ describe.each(profiles)('native product parity: %s protocol fixture', (profile) 
   it('stops the external turn through the native stop control and accepts the next turn', async () => {
     const { settled } = await send('E2E_STOP')
     await page.getByText('E2E_RUNNING', { exact: true }).waitFor()
-    await page.getByRole('button', { name: 'Stop generating', exact: true }).click()
-    await settled
-    expect(readFileSync(agentLog, 'utf8')).toContain('regression cancelled')
-    const next = await send('E2E_MESSAGE')
-    await next.settled
-    await page.getByText('E2E_DONE mock-model-a', { exact: true }).waitFor()
+    const stopping = required(
+      events.findLast(
+        (event) =>
+          event.type === 'user/message' &&
+          event.data.content.some((block) => block.type === 'text' && block.text === 'E2E_STOP'),
+      ),
+    )
+    const sidecar = createAcpSidecar({ root: required(host.ctx.dshHomePath)('dsh-acp') })
+    const bindingIdentity = async () => {
+      const lookup = await sidecar.readLatestBinding(stopping.sessionId)
+      if (lookup?.status !== 'ok') throw new Error('Expected a valid ACP binding for the stopped session')
+      return { agentSessionId: lookup.binding.agentSessionId, generation: lookup.binding.generation }
+    }
+    try {
+      const beforeStop = await bindingIdentity()
+      expect(required(regressionPrompts().at(-1)).endsWith(` session=${beforeStop.agentSessionId}`)).toBe(true)
+      await page.getByRole('button', { name: 'Stop generating', exact: true }).click()
+      expect(await settled).toBe(stopping.sessionId)
+      expect(readFileSync(agentLog, 'utf8')).toContain('regression cancelled')
+      expect(await bindingIdentity()).toEqual(beforeStop)
+      const next = await send('E2E_MESSAGE')
+      expect(await next.settled).toBe(stopping.sessionId)
+      await page.getByText('E2E_DONE mock-model-a', { exact: true }).waitFor()
+      expect(await bindingIdentity()).toEqual(beforeStop)
+      const lastPrompt = required(regressionPrompts().at(-1))
+      expect(lastPrompt.endsWith(` session=${beforeStop.agentSessionId}`)).toBe(true)
+      await reloadWithoutDispatchOrReplay(stopping.sessionId, ['E2E_RUNNING', 'E2E_DONE mock-model-a'])
+      expect(await bindingIdentity()).toEqual(beforeStop)
+    } finally {
+      await sidecar.dispose()
+    }
   })
 
   for (const atomic of [false, true])

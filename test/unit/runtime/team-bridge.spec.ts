@@ -33,6 +33,10 @@ class BridgeFakePtcRuntime extends PtcRuntime {
   }
 }
 
+function withInitiator<T>(_agent: unknown, operation: () => T): T {
+  return operation()
+}
+
 function createFeedbackSession(source: unknown = { kind: 'user' }): Session {
   const session = Session.create(SessionId('lead'))
   session.append('turn/start', { turn: 1 })
@@ -68,6 +72,17 @@ afterEach(async () => {
       .reverse()
       .map((close) => close()),
   )
+})
+
+it('leaves Team creation policy to native instructions while preserving the ACP context boundary', async () => {
+  const fixture = await setup()
+  const instructions = fixture.client.getInstructions() ?? ''
+  for (const text of [instructions, fixture.lease.instructions]) {
+    expect(text).toContain('members share the workspace and only fresh context is supported')
+    expect(text).not.toContain('explicit user request for a team')
+    expect(text).not.toContain('Create teams only when explicitly requested')
+  }
+  expect(fixture.lease.instructions).toContain('Team target names resolve within the caller’s Team')
 })
 
 it('records actual MCP-to-Host execution correlation and isolates a throwing trace sink', async () => {
@@ -231,7 +246,10 @@ async function setup(
             ? membership.current
             : undefined,
     },
-    agents: { get: (id: string) => (id === 'lead' ? agent : id === 'team-root' ? rootAgent : undefined) },
+    agents: {
+      get: (id: string) => (id === 'lead' ? agent : id === 'team-root' ? rootAgent : undefined),
+      withInitiator,
+    },
     tools: {
       schemas: (scope: unknown) =>
         scope === agent ? [...definitions.values()].filter((definition) => !hidden.has(definition.name)) : [],
@@ -305,6 +323,7 @@ async function setup(
       currentAgent = replacement
       services.agents = {
         get: (id: string) => (id === 'lead' ? currentAgent : id === 'team-root' ? rootAgent : undefined),
+        withInitiator,
       }
     },
   }
@@ -377,7 +396,7 @@ describe('session-owned native Teams MCP bridge', () => {
     const bridgeCtx = {
       on: (name: string, listener: (...args: unknown[]) => void) => dsh.on(name as never, listener as never),
       get: (name: string) => {
-        if (name === 'agents') return { get: (id: string) => (id === agent.id ? agent : undefined) }
+        if (name === 'agents') return { get: (id: string) => (id === agent.id ? agent : undefined), withInitiator }
         if (name === 'agentTeams' || name === 'attachments') return undefined
         return dsh.get(name as never)
       },
@@ -512,7 +531,7 @@ describe('session-owned native Teams MCP bridge', () => {
     const bridgeCtx = {
       on: (name: string, listener: (...args: unknown[]) => void) => dsh.on(name as never, listener as never),
       get: (name: string) => {
-        if (name === 'agents') return { get: (id: string) => (id === agent.id ? agent : undefined) }
+        if (name === 'agents') return { get: (id: string) => (id === agent.id ? agent : undefined), withInitiator }
         if (name === 'agentTeams' || name === 'attachments') return undefined
         return dsh.get(name as never)
       },
@@ -1067,52 +1086,74 @@ describe('session-owned native Teams MCP bridge', () => {
     expect(fixture.lease.hasRetainedFeedback?.()).toBe(true)
   })
 
-  it('defers wait_agent before Host execution when a Team message is queued for the caller', async () => {
-    const events: LiveDiagnosticEvent[] = []
-    const remove = installLiveDiagnosticTrace(
-      Object.assign(
-        (event: LiveDiagnosticEvent) => {
-          events.push(event)
-        },
-        {
-          id: () => `h:${'a'.repeat(24)}`,
-          fingerprint: () => ({ hmac: `h:${'b'.repeat(24)}`, bytes: 0, complete: true }),
-        },
-      ),
-    )
-    diagnosticRemovers.push(remove)
+  it.each([{ kind: 'team-message' }, { kind: 'agent-message', form: 'relay', senderSessionId: 'teammate' }])(
+    'defers wait_agent before Host execution when a peer message is queued (%j)',
+    async (source) => {
+      const events: LiveDiagnosticEvent[] = []
+      const remove = installLiveDiagnosticTrace(
+        Object.assign(
+          (event: LiveDiagnosticEvent) => {
+            events.push(event)
+          },
+          {
+            id: () => `h:${'a'.repeat(24)}`,
+            fingerprint: () => ({ hmac: `h:${'b'.repeat(24)}`, bytes: 0, complete: true }),
+          },
+        ),
+      )
+      diagnosticRemovers.push(remove)
+      const { lease, client, execute, agent } = await setup()
+      lease.beginPrompt(new AbortController().signal)
+      const queuedReply = createUserMessage({
+        source: source as never,
+        content: [{ type: 'text', text: 'PRIVATE_QUEUED_TEAM_REPLY' }],
+      })
+      agent.inbox.nextStep.push(queuedReply)
+
+      const result = await client.callTool({ name: 'wait_agent', arguments: { timeout_ms: 60_000 } })
+      const returnedText = result.content.map((item) => ('text' in item ? item.text : '')).join('\n')
+
+      expect(result.isError).toBe(true)
+      expect(returnedText).toContain('A Team message is already queued for this caller')
+      expect(returnedText).toContain('DSH did not execute wait_agent')
+      expect(returnedText).toContain('End this ACP response now')
+      expect(returnedText).not.toContain('no-active-peer')
+      expect(returnedText).not.toContain('PRIVATE_QUEUED_TEAM_REPLY')
+      expect(execute).not.toHaveBeenCalled()
+      expect(agent.inbox.nextStep).toEqual([queuedReply])
+      expect(
+        events.filter((event) => event.type === 'host-execute/start' || event.type === 'host-execute/settled'),
+      ).toEqual([])
+      expect(events.map((event) => event.type)).not.toContain('team-message/receipt')
+      expect(events.find((event) => event.type === 'mcp-handler/returned')).toMatchObject({
+        type: 'mcp-handler/returned',
+        tool: 'wait_agent',
+        resultStatus: 'error',
+        handlerIsError: true,
+        inboxSnapshotStage: 'before-host-call',
+        nextStepTeamMessageCount: 1,
+      })
+      expect(events.find((event) => event.type === 'mcp-handler/returned')).not.toHaveProperty('hostCallId')
+    },
+  )
+
+  it.each([
+    { kind: 'agent-message', form: 'notice', senderSessionId: 'teammate' },
+    { kind: 'agent-message', form: 'relay' },
+    { kind: 'agent-message', form: 'relay', senderSessionId: '' },
+    { kind: 'subagent-settled', form: 'notice', senderSessionId: 'teammate' },
+  ])('does not treat unrelated or incomplete Agent sources as pending peer messages (%j)', async (source) => {
     const { lease, client, execute, agent } = await setup()
     lease.beginPrompt(new AbortController().signal)
-    const queuedReply = createUserMessage({
-      source: { kind: 'team-message' } as never,
-      content: [{ type: 'text', text: 'PRIVATE_QUEUED_TEAM_REPLY' }],
-    })
-    agent.inbox.nextStep.push(queuedReply)
-
-    const result = await client.callTool({ name: 'wait_agent', arguments: { timeout_ms: 60_000 } })
-    const returnedText = result.content.map((item) => ('text' in item ? item.text : '')).join('\n')
-
-    expect(result.isError).toBe(true)
-    expect(returnedText).toContain('A Team message is already queued for this caller')
-    expect(returnedText).toContain('DSH did not execute wait_agent')
-    expect(returnedText).toContain('End this ACP response now')
-    expect(returnedText).not.toContain('no-active-peer')
-    expect(returnedText).not.toContain('PRIVATE_QUEUED_TEAM_REPLY')
-    expect(execute).not.toHaveBeenCalled()
-    expect(agent.inbox.nextStep).toEqual([queuedReply])
-    expect(
-      events.filter((event) => event.type === 'host-execute/start' || event.type === 'host-execute/settled'),
-    ).toEqual([])
-    expect(events.map((event) => event.type)).not.toContain('team-message/receipt')
-    expect(events.find((event) => event.type === 'mcp-handler/returned')).toMatchObject({
-      type: 'mcp-handler/returned',
-      tool: 'wait_agent',
-      resultStatus: 'error',
-      handlerIsError: true,
-      inboxSnapshotStage: 'before-host-call',
-      nextStepTeamMessageCount: 1,
-    })
-    expect(events.find((event) => event.type === 'mcp-handler/returned')).not.toHaveProperty('hostCallId')
+    agent.inbox.nextStep.push(
+      createUserMessage({
+        source: source as never,
+        content: [{ type: 'text', text: 'not a peer relay' }],
+      }),
+    )
+    const result = await client.callTool({ name: 'wait_agent', arguments: { timeout_ms: 1 } })
+    expect(result.isError).not.toBe(true)
+    expect(execute).toHaveBeenCalledTimes(1)
   })
 
   it('executes wait_agent normally when no Team message is queued', async () => {
@@ -1347,13 +1388,14 @@ describe('session-owned native Teams MCP bridge', () => {
       { name: 'file_read', description: 'Visible read' },
     ])
   })
-  it.each(['native', 'ptc', 'both'] as const)(
+  it.each(['native', 'ptc'] as const)(
     'uses official assembled %s schemas as the bridge directory and preserves ToolRuntime execution limits',
     async (mode) => {
       const dsh = new CordisContext()
       const systemPromptFiber = await dsh.plugin(SystemPrompt, {})
       const ptcFiber = mode === 'native' ? undefined : await dsh.plugin(BridgeFakePtcRuntime)
       const runtimeFiber = await dsh.plugin(ToolRuntime, { mode })
+      dsh.provide('workingDirectory', { ensure: async () => process.cwd() } as never)
       cleanup.push(async () => {
         await runtimeFiber.dispose()
         await ptcFiber?.dispose()
@@ -1380,13 +1422,12 @@ describe('session-owned native Teams MCP bridge', () => {
         steer: vi.fn(),
       }
       const assembly = await dsh.systemPrompt.assemble({ scope: agent as never })
-      const expected =
-        mode === 'native' ? ['file_read'] : mode === 'ptc' ? [RUN_CODE_NAME] : ['file_read', RUN_CODE_NAME]
+      const expected = mode === 'native' ? ['file_read'] : [RUN_CODE_NAME]
       expect(assembly.tools.map((schema) => schema.name).sort()).toEqual([...expected].sort())
       const bridgeCtx = {
         on: (name: string, listener: (...args: unknown[]) => void) => dsh.on(name as never, listener as never),
         get: (name: string) => {
-          if (name === 'agents') return { get: (id: string) => (id === agent.id ? agent : undefined) }
+          if (name === 'agents') return { get: (id: string) => (id === agent.id ? agent : undefined), withInitiator }
           if (name === 'agentTeams' || name === 'attachments') return undefined
           return dsh.get(name as never)
         },

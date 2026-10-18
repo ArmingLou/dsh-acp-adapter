@@ -1,7 +1,7 @@
 /**
- * Copy dictionaries for the ACP plugin detail panel. Precedent:
+ * Copy dictionaries for ACP configuration, conversations, Teams, and diagnostics. Precedent:
  * ui-settings-models/src/client/locales.ts — one flat template-string map per
- * locale, keyed by a union type the panel's `t` seat is narrowed to.
+ * locale, keyed by a union type each component's `t` seat is narrowed to.
  *
  * 用户可见文案保持简短；协议和产品边界由 README 维护。
  */
@@ -39,6 +39,7 @@ const zh = {
   toastProfileSaveFailed: '无法保存 Agent，请检查配置详情',
   toastProfileDeleted: '已删除',
   toastProfileDeleteFailed: '无法删除 Agent，请查看配置详情',
+  toastSessionOutcome: '{message}（会话：{session}）',
   agentControlRunning: '运行中可查看设置；停止后可修改。',
   agentControlReadOnly: '当前设置只读。',
   teamMemberOpen: '查看 {name} 的会话',
@@ -358,6 +359,7 @@ const zh = {
   'activity.expandCount': '展开其余 {count} 行',
   'activity.read.window': '显示 {shown} / {total} 行',
   'activity.terminal.signal': '信号 {signal}',
+  'activity.terminal.commandLine': '命令第 {line} 行',
   'activity.terminal.exitCode': '退出码 {code}',
   'activity.terminal.noExitCode': '未提供退出码',
   'activity.terminal.noOutput': '无输出',
@@ -430,6 +432,7 @@ const en: Record<AcpLocaleKey, string> = {
   toastProfileSaveFailed: 'Could not save this Agent. Review the configuration details',
   toastProfileDeleted: 'Deleted',
   toastProfileDeleteFailed: 'Could not delete this Agent. Review the configuration details',
+  toastSessionOutcome: '{message} (Session: {session})',
   agentControlRunning: 'Settings are read-only while running. Stop to make changes.',
   agentControlReadOnly: 'These settings are currently read-only.',
   teamMemberOpen: 'Open {name}’s session',
@@ -766,6 +769,7 @@ const en: Record<AcpLocaleKey, string> = {
   'activity.expandCount': 'Expand {count} more lines',
   'activity.read.window': 'Showing {shown} of {total} lines',
   'activity.terminal.signal': 'signal {signal}',
+  'activity.terminal.commandLine': 'Command line {line}',
   'activity.terminal.exitCode': 'exit code {code}',
   'activity.terminal.noExitCode': 'No exit code',
   'activity.terminal.noOutput': 'No output',

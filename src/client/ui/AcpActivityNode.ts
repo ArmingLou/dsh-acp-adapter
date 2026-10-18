@@ -1,4 +1,5 @@
 import type { PropsRenderFactories } from '@deepseek-ai/dsh-client-ui-slots'
+import { PartialArguments } from '@deepseek-ai/dsh-util-values'
 import { activityDiffsOf } from '../../contract/activity-diffs.ts'
 import {
   createElement as h,
@@ -62,7 +63,6 @@ export type ActivityNodeProps = {
   readonly sessionId: string
   readonly t: (key: AcpLocaleKey, params?: Record<string, string | number>) => string
   readonly journalHub: AcpActivityJournalHub
-  readonly onProjectedChild?: (parentSessionId: string, childSessionId: string) => void
   readonly onOpenProjectedChild?: (parentSessionId: string, childSessionId: string) => void
   readonly jsonStringWrapping?: AcpJsonStringWrapping
   readonly renderTool?: (row: AcpActivityView) => ReactNode
@@ -260,6 +260,7 @@ function diffLabels(t: ActivityNodeProps['t']) {
 
 function terminalLabels(t: ActivityNodeProps['t']): TerminalBlockLabels {
   return {
+    commandLine: (line) => t('activity.terminal.commandLine', { line }),
     signal: (signal) => t('activity.terminal.signal', { signal }),
     exitCode: (code) => t('activity.terminal.exitCode', { code }),
     noExitCode: t('activity.terminal.noExitCode'),
@@ -798,7 +799,6 @@ export function AcpActivityContent({
   journalHub,
   t,
   openFile,
-  onProjectedChild,
   onOpenProjectedChild,
   jsonStringWrapping,
   renderTool,
@@ -823,10 +823,6 @@ export function AcpActivityContent({
       const isRetrying = handle.retrying()
       setUnavailable(hasError && !handle.loading() && stableFailure)
       setReconnecting(hasError && !stableFailure && !isRetrying)
-      for (const row of all) {
-        const projected = completedProjectedChild(row)
-        if (projected !== undefined) onProjectedChild?.(projected.parentSessionId, projected.childSessionId)
-      }
     }
     const ownerSessionId = activityJournalSessionId(data, sessionId)
     handle = journalHub.acquire(ownerSessionId, ownerSessionId, data.promptAnchorMessageId, publish)
@@ -836,7 +832,7 @@ export function AcpActivityContent({
       retryRef.current = undefined
       handle.release()
     }
-  }, [data.ownerDshSessionId, data.promptAnchorMessageId, sessionId, journalHub, onProjectedChild])
+  }, [data.ownerDshSessionId, data.promptAnchorMessageId, sessionId, journalHub])
 
   if (rows.length === 0 && !unavailable && !reconnecting) return null
   return h(
@@ -973,8 +969,9 @@ export function nativeActivityToolBlock(
   }
   const callId = `acp:${row.ownerDshSessionId}:${row.promptAnchorMessageId}:${row.activityId}`
   const argsRaw = input === undefined ? '{}' : typeof input === 'string' ? input : JSON.stringify(input)
+  const args = PartialArguments.fromText(argsRaw)
   if (row.status === 'running')
-    return { callId, name, phase: 'start', argsRaw, turn: 0, step: 0, time: row.time, subCalls: [] }
+    return { callId, name, phase: 'start', args, argsRaw, turn: 0, step: 0, time: row.time, subCalls: [] }
   let output = contentText(detail.rawOutput ?? detail.content)
   if (name === 'read' && read !== undefined && meta !== undefined) {
     output = `<path>${read.label}</path>\n<type>file</type>\n<content>\n${output}\n</content>`
@@ -987,6 +984,8 @@ export function nativeActivityToolBlock(
   return {
     kind: 'tool-result',
     callId,
+    name,
+    args,
     seq: row.activitySeq,
     time: row.time,
     callTime: null,

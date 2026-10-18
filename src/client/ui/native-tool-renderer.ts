@@ -8,33 +8,34 @@ import type {
 } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type { StoredEntry } from '@deepseek-ai/dsh-client-ui-slots'
 
-type NativeOwner = ChatNodeOwnerProps & Pick<ChatNodeViewProps, 'useDisclosure'> & { node: ChatConversationViewNode }
+type NativeOwner = ChatNodeOwnerProps &
+  Pick<ChatNodeViewProps, 'useDisclosure' | 'useGroupAction'> & {
+    node: ChatConversationViewNode
+  }
 export type NativeToolOwner = NativeOwner & { node: ChatNodeViewProps<'tool-call'>['node'] }
 export function nativeOwner(props: NativeOwner): NativeOwner {
   const {
     useDisclosure,
+    useGroupAction,
     groupPart,
     cwd,
     openFile,
-    openSkill,
     inspectCall,
     forkAt,
     loadImage,
-    renderMessageImages,
     fileMentions,
     turnProcess,
     node,
   } = props
   return {
     useDisclosure,
+    useGroupAction,
     ...(groupPart === undefined ? {} : { groupPart }),
     cwd,
     openFile,
-    openSkill,
     inspectCall,
     forkAt,
     loadImage,
-    renderMessageImages,
     fileMentions,
     turnProcess,
     node,

@@ -10,6 +10,7 @@ import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-plugin-manager/client'
 import type {} from '@deepseek-ai/dsh-client-ui-session/client'
+import type { ClientRemoteAccess } from '@deepseek-ai/dsh-api-remote-access/client'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 import { isMainSession, openSubagentAside } from './coordinator/native-session-navigation.ts'
@@ -31,13 +32,14 @@ import { CrossBackendModal } from './ui/CrossBackendModal.ts'
 import { AcpOutcomeToast } from './ui/AcpOutcomeToast.ts'
 import { AcpRecoveryDock } from './ui/AcpRecoveryDock.ts'
 import { AcpAgentControl } from './ui/AcpAgentControl.ts'
+import type { SessionAccessSource } from './ui/session-action-access.ts'
 import { AcpTeamManagement } from './ui/AcpTeamManagement.ts'
 import { AcpTeamApprovals } from './ui/AcpTeamApprovals.ts'
 import type { AcpTeamApprovalActions } from './ui/AcpTeamApprovals.ts'
+import { followNativeTeamUi } from './ui/native-team-ui-lifecycle.ts'
 import { resolveCrossBackendLocation } from './data/cross-backend-controller.ts'
 import { AcpPanelController } from './data/controller.ts'
 import { ManagedAcpRouteCatalog } from './data/managed-routes.ts'
-import { ProjectedSubagentCatalog } from './data/projected-subagents.ts'
 import { createAcpPanelStore } from './data/stores/panel-store.ts'
 import type { AcpPanelStoreActions } from './data/stores/panel-store.ts'
 import { AcpSection } from './ui/AcpSection.ts'
@@ -71,6 +73,7 @@ export const inject = [
   'slots',
   'locale',
   'remote',
+  'remoteAccess',
   'sessions',
   'workspaces',
   'uiWorkspace',
@@ -83,6 +86,12 @@ export const inject = [
 /** Normalize ACP presentation facts and compose the registered native UI. */
 async function registerUi(ctx: ClientContext): Promise<void> {
   const acpRemote: AcpRemoteLike = ctx.remote.dshAcp
+  const sessionAccessSource: SessionAccessSource = (sessionId, action) => {
+    // Host and Client merge different RemoteAccess faces into Cordis Context.
+    // This UI reads only the published Client source, and never grants on absence.
+    const access = ctx.get('remoteAccess') as unknown as ClientRemoteAccess | undefined
+    return typeof access?.source === 'function' ? access.source('session', sessionId, action) : undefined
+  }
   const journalHub = new AcpActivityJournalHub(acpRemote, ctx.remote)
   const sessions = ctx.get('sessions') as unknown as ISessions
   const workspaces = ctx.get('workspaces') as unknown as IWorkspaces
@@ -95,11 +104,6 @@ async function registerUi(ctx: ClientContext): Promise<void> {
   }
   const settingsScope = ctx.configForms.get<AcpSettings>(ACP_SETTINGS_NS)
   const ownedRoutes = await acpRemote.ownedProviderRoutes().catch(() => undefined)
-  const projectedIds = await acpRemote.projectedSubagentIds().catch(() => undefined)
-  const projectedSubagents = new ProjectedSubagentCatalog(
-    acpRemote,
-    projectedIds?.ok === true ? projectedIds.value.sessionIds : [],
-  )
   const managedRoutes = new ManagedAcpRouteCatalog(
     settingsScope,
     ownedRoutes?.ok === true ? ownedRoutes.value.providers : [],
@@ -232,9 +236,6 @@ async function registerUi(ctx: ClientContext): Promise<void> {
     journalHub,
     t: ctx.locale.bind('acpActivity'),
     jsonStringWrapping,
-    onProjectedChild: (_parentSessionId, childSessionId) => {
-      projectedSubagents.add(childSessionId)
-    },
     onOpenProjectedChild: openProjectedChild,
   })
   ctx.slots.inject('conversation.chat.node', () =>
@@ -245,14 +246,10 @@ async function registerUi(ctx: ClientContext): Promise<void> {
         locale: 'acpActivity',
         inject: (): {
           readonly journalHub: AcpActivityJournalHub
-          readonly onProjectedChild: (parentSessionId: string, childSessionId: string) => void
           readonly onOpenProjectedChild: (parentSessionId: string, childSessionId: string) => void
           readonly jsonStringWrapping: AcpJsonStringWrapping
         } => ({
           journalHub,
-          onProjectedChild: (_parentSessionId, childSessionId) => {
-            projectedSubagents.add(childSessionId)
-          },
           onOpenProjectedChild: openProjectedChild,
           jsonStringWrapping,
         }),
@@ -261,7 +258,7 @@ async function registerUi(ctx: ClientContext): Promise<void> {
     ),
   )
   const coordinator = new CrossBackendCoordinator(ctx, managedRoutes.owns)
-  // RC publishes team identity through the shared Session projection. The ACP
+  // DSH publishes team identity through the shared Session projection. The ACP
   // Remote remains responsible for ACP-specific metadata and authorized writes.
   ctx.inject(['remote.subagents', 'uiSession'], (teamCtx) => {
     const actions: AcpTeamApprovalActions = {
@@ -278,41 +275,53 @@ async function registerUi(ctx: ClientContext): Promise<void> {
         openSubagentAside(ctx.sidebarRight, { parentSessionId, childSessionId, mode: 'continuable' })
       },
     }
-    teamCtx.slots.inject('conversation.session.header.utilities', () =>
-      teamCtx.slots.register(
-        {
-          name: 'conversation.session.header.utilities',
-          id: 'acp-team-management',
-          order: 94,
-          locale: 'acpActivity',
-          inject: () => ({
-            remote: ctx.remote.dshAcp,
-            streamFactory: ctx.remote,
-            loadMembers: actions.loadMembers,
-            ownsRoute: managedRoutes.owns,
-            isCurrent: actions.isCurrent,
-            status: actions.status,
-            openMember: actions.openMember,
-            async interruptMember(lead: SessionId, member: SessionId) {
-              const result = await teamCtx.remote.subagents.interruptByParent(member, lead, 'continuable')
-              if (!result.ok) throw new Error(result.error.message)
-            },
-          }),
-        },
-        AcpTeamManagement,
-      ),
-    )
-    teamCtx.slots.inject('conversation.input.dock', () =>
-      teamCtx.slots.register(
-        {
-          name: 'conversation.input.dock',
-          id: 'acp-team-approvals',
-          order: 95,
-          locale: 'acpActivity',
-          inject: () => actions,
-        },
-        AcpTeamApprovals,
-      ),
+    teamCtx.effect(
+      () =>
+        followNativeTeamUi(teamCtx.slots, () => {
+          const unmount = teamCtx.effect(function* () {
+            yield teamCtx.slots.inject('conversation.session.header.utilities', () =>
+              teamCtx.slots.register(
+                {
+                  name: 'conversation.session.header.utilities',
+                  id: 'acp-team-management',
+                  order: 94,
+                  locale: 'acpActivity',
+                  inject: () => ({
+                    remote: ctx.remote.dshAcp,
+                    streamFactory: ctx.remote,
+                    loadMembers: actions.loadMembers,
+                    ownsRoute: managedRoutes.owns,
+                    isCurrent: actions.isCurrent,
+                    status: actions.status,
+                    openMember: actions.openMember,
+                    sessionAccessSource,
+                    async interruptMember(lead: SessionId, member: SessionId) {
+                      const result = await teamCtx.remote.subagents.interruptByParent(member, lead, 'continuable')
+                      if (!result.ok) throw new Error(result.error.message)
+                    },
+                  }),
+                },
+                AcpTeamManagement,
+              ),
+            )
+            yield teamCtx.slots.inject('conversation.input.dock', () =>
+              teamCtx.slots.register(
+                {
+                  name: 'conversation.input.dock',
+                  id: 'acp-team-approvals',
+                  order: 95,
+                  locale: 'acpActivity',
+                  inject: () => actions,
+                },
+                AcpTeamApprovals,
+              ),
+            )
+          }, 'dsh-acp: active native Team controls')
+          return () => {
+            void unmount()
+          }
+        }),
+      'dsh-acp: native Team UI lifecycle',
     )
   })
   ctx.effect(() => coordinator.start(), 'dsh-acp: model transition coordinator')
@@ -349,9 +358,11 @@ async function registerUi(ctx: ClientContext): Promise<void> {
           readonly remote: AcpRemoteLike
           readonly streamFactory: RemoteStreamFactory
           readonly createNewSession: (sourceSessionId: string) => Promise<void>
+          readonly sessionAccessSource: SessionAccessSource
           readonly ownsRoute: typeof managedRoutes.owns
         } => ({
           remote: acpRemote,
+          sessionAccessSource,
           streamFactory: ctx.remote,
           ownsRoute: managedRoutes.owns,
           createNewSession: async (sourceSessionId) => {
@@ -382,10 +393,14 @@ async function registerUi(ctx: ClientContext): Promise<void> {
           readonly ownsRoute: typeof managedRoutes.owns
           readonly getDefaultProvider: () => Promise<string | undefined>
           readonly watchDefaultProvider: (changed: () => void) => () => void
+          readonly feedback: Pick<AcpUiFeedback, 'report'>
+          readonly sessionAccessSource: SessionAccessSource
         } => ({
           remote: acpRemote,
+          sessionAccessSource,
           streamFactory: ctx.remote,
           ownsRoute: managedRoutes.owns,
+          feedback,
           getDefaultProvider: async () => {
             const result = await ctx.remote.session.modelCatalog()
             return result.ok ? result.value.default.provider : undefined

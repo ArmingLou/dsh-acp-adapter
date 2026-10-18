@@ -4,6 +4,7 @@ import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import type {} from '@deepseek-ai/dsh-permission-presets'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-tool-todo'
+import type {} from '@deepseek-ai/dsh-working-directory'
 import {
   applySessionFact,
   initialSessionFacts,
@@ -39,6 +40,9 @@ export function acpSessionView(ctx: Context, session: Session | undefined): Sess
   return {
     identity: session,
     header: session.header,
+    get workingDirectory() {
+      return ctx.get('workingDirectory')?.get(session)
+    },
     get seq() {
       return session.seq
     },
@@ -82,6 +86,10 @@ export function acpSessionView(ctx: Context, session: Session | undefined): Sess
     watchTurnEnd: (listener) =>
       ctx.on('session/event', (owner, event) => {
         if (owner.id === session.id && event.type === 'turn/end') listener()
+      }),
+    watchWorkingDirectory: (listener) =>
+      ctx.on('session/event', (owner, event) => {
+        if (owner === session && event.type === 'working-directory/change') listener(event.data.cwd)
       }),
     watchRouteChange: (provider, listener) =>
       ctx.on('agent/request', async ({ agent }, next) => {
