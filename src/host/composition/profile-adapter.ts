@@ -1061,7 +1061,17 @@ export class AcpProfileAdapter extends LlmAdapter {
     const generation = this.currentProbeGeneration()
     if (generation === undefined)
       throw new LlmError(`ACP profile "${this.profileId}" is no longer configured`, 'ACP_UNKNOWN_PROFILE')
-    const models = await generation.probe.listModels(provider)
+    let models: readonly LlmModelInfo[]
+    try {
+      models = await generation.probe.listModels(provider)
+    } catch (error: unknown) {
+      const snapshot = generation.probe.probeSnapshot?.(provider)
+      if (snapshot?.result.kind === 'ok') {
+        models = snapshot.result.models
+      } else {
+        throw error
+      }
+    }
     const found = models.find((entry) => entry.id === model)
     const reasoning = reasoningInfoFromConfigOptions(
       this.profileId,

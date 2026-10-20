@@ -32,7 +32,7 @@ import type {
   StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import type * as acp from '@agentclientprotocol/sdk'
-import { acpProbeConfigKey, acpProbeFresh } from '../../domain/session/agent-config.ts'
+import { ACP_PROBE_CACHE_OK_TTL_MS, acpProbeConfigKey, acpProbeFresh } from '../../domain/session/agent-config.ts'
 import type { AcpStubAgentConfig } from '../../domain/session/agent-config.ts'
 import { effectiveRuntimeOf } from '../../contract/agent-config.ts'
 import { modelProbeOptions } from '../../domain/session/agent-compatibility.ts'
@@ -520,6 +520,22 @@ export class AcpStubAdapter extends LlmAdapter {
       return models
     } catch (error: unknown) {
       const failure = acpProbeFailure(error, config)
+      const previous = this.cache.get(provider)
+      if (previous?.key === key && previous.result.kind === 'ok') {
+        const warn =
+          this.options.onWarn ??
+          ((message: string) => {
+            process.stderr.write(`dsh-acp: ${message}\n`)
+          })
+        warn(
+          `probe re-check failed for "${provider}" (${failure.error.message}); preserving previous verified model catalog`,
+        )
+        this.cache.set(provider, {
+          ...previous,
+          at: Date.now() - (ACP_PROBE_CACHE_OK_TTL_MS - 60_000),
+        })
+        return previous.result.models
+      }
       this.cache.set(provider, {
         key,
         at: Date.now(),

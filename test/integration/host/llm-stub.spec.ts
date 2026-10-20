@@ -389,6 +389,56 @@ describe(' 缓存 TTL（acpProbeFresh；ok 10min / error 30s）', () => {
       vi.useRealTimers()
     }
   })
+
+  it('ok 条目过期后重 probe 失败时保留原模型列表，不击毁缓存', async () => {
+    const script = `
+let buf = '';
+process.stdin.on('data', (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.id === undefined || msg.method === undefined) continue;
+    if (process.env.MOCK_DYNAMIC_FAIL === '1') {
+      process.exit(1);
+    }
+    if (msg.method === 'initialize') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } }) + '\\n');
+    } else if (msg.method === 'session/new') {
+      process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 's1', configOptions: [{ type: 'select', id: 'model', name: 'Model', category: 'model', currentValue: 'm1', options: [{ value: 'm1', name: 'Model 1' }] }] } }) + '\\n');
+    }
+  }
+});
+setInterval(() => {}, 1 << 30);
+`
+    const config: AcpStubAgentConfig = {
+      name: 'DynamicAgent',
+      command: process.execPath,
+      args: ['-e', script],
+      env: {},
+    }
+    const { adapter } = makeAdapter({ [ROUTE]: config })
+    const clock = fakeClock()
+    try {
+      const initial = await adapter.listModels(ROUTE)
+      expect(initial).toHaveLength(1)
+      expect(initial[0]?.id).toBe('m1')
+
+      clock.advance(10 * 60_000 + 1)
+      process.env.MOCK_DYNAMIC_FAIL = '1'
+
+      const fallback = await adapter.listModels(ROUTE)
+      expect(fallback).toHaveLength(1)
+      expect(fallback[0]?.id).toBe('m1')
+    } finally {
+      delete process.env.MOCK_DYNAMIC_FAIL
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('probe 失败文案（AcpClientError.kind → 面向用户 message）', () => {

@@ -77,7 +77,7 @@ import type {
 } from './types.ts'
 
 export const DEFAULT_INITIALIZE_TIMEOUT_MS = 15_000
-const DEFAULT_PROBE_TIMEOUT_MS = 15_000
+const DEFAULT_PROBE_TIMEOUT_MS = 30_000
 /**
  * 会话建立类 RPC 的默认预算（session/new、session/load、session/resume、session/list）：
  * load 要回放历史，给足 30s；其余沿用同一建立预算，调用方可经
