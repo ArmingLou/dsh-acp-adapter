@@ -553,8 +553,8 @@ export async function regressionTurn(
       if (allowed) fs.writeFileSync(`${session.cwd}/approval-marker.txt`, 'E2E_APPROVED')
       say(allowed ? 'E2E_APPROVED' : 'E2E_DENIED')
     } else if (prompt.includes('E2E_PLUGIN_FOLLOWUP')) {
-      if (!prompt.includes('E2E_SYSTEM_A') || prompt.includes('E2E_CONTEXT_A'))
-        throw new Error('Host follow-up context is missing or earlier user input was replayed')
+      if (prompt.includes('E2E_SYSTEM_A') || prompt.includes('E2E_CONTEXT_A'))
+        throw new Error('Redundant host instructions or earlier user input was replayed')
       say('E2E_FOLLOWUP_DONE')
     } else if (/E2E_CONTEXT_[AB]/.test(prompt)) {
       const version = prompt.includes('E2E_CONTEXT_B') ? 'B' : 'A'

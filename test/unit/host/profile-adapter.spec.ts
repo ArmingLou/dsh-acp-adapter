@@ -147,6 +147,44 @@ describe('AcpProfileAdapter generation and dispatch boundaries', () => {
     expect(JSON.stringify(sent)).not.toContain('old history')
   })
 
+  it('omits redundant host instructions on subsequent turns within the same session when unchanged', async () => {
+    const sent: unknown[] = []
+    let currentMessage = user('turn 1')
+    const adapter = new AcpProfileAdapter(
+      'test',
+      () => profile(),
+      seam(),
+      () => session(currentMessage),
+      new Ledger(),
+      undefined,
+      () => ({
+        acpSessionId: 'strip-redundant-request',
+        start: async () => undefined,
+        prompt: async (prompt) => {
+          sent.push(prompt)
+          return { stopReason: 'end_turn' } as never
+        },
+        close: async () => undefined,
+      }),
+      durableSidecar,
+    )
+    const systemA = { ...user('HOST_SYSTEM_A'), role: 'system' as const, source: { kind: 'system-prompt' as const } }
+    const turn1 = request('strip-redundant-request', [systemA, currentMessage])
+    for await (const chunk of adapter.stream(turn1)) void chunk
+    expect(JSON.stringify(sent[0])).toContain('HOST_SYSTEM_A')
+
+    currentMessage = user('turn 2')
+    const turn2 = request('strip-redundant-request', [systemA, currentMessage])
+    for await (const chunk of adapter.stream(turn2)) void chunk
+    expect(JSON.stringify(sent[1])).not.toContain('HOST_SYSTEM_A')
+
+    currentMessage = user('turn 3')
+    const systemB = { ...user('HOST_SYSTEM_B'), role: 'system' as const, source: { kind: 'system-prompt' as const } }
+    const turn3 = request('strip-redundant-request', [systemB, currentMessage])
+    for await (const chunk of adapter.stream(turn3)) void chunk
+    expect(JSON.stringify(sent[2])).toContain('HOST_SYSTEM_B')
+  })
+
   it.each(['native', 'ptc'] as const)(
     'projects the real DSH effective context through composition into a new ACP binding (%s)',
     async (mode) => {
