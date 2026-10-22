@@ -1,4 +1,5 @@
-import { join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { expect, it, vi } from 'vitest'
 import { connectFreshWorkspace, writeComposerDraft } from '#host-support'
 import { launchAdapterWorld, root } from './scaffold.ts'
@@ -7,10 +8,28 @@ import type { TestBrowser } from './browser.ts'
 import type { AcpRemoteService } from '../../src/remote/service.js'
 import type {} from '@deepseek-ai/dsh-plugin-manager'
 import { required } from './required.ts'
+import { acpPermissionAudit } from './acp-permission-audit.ts'
+import { installTeamFixtureApprovals, teamMemberSetupSteps, teamStartSteps } from './team-fixture-approval.ts'
+
+/** spawn_teammate returning does not mean the independent child has finished setup. */
+async function waitForMemberSetup(gate: string, deadlineAt: number): Promise<void> {
+  const directory = dirname(gate)
+  const prefix = `${basename(gate)}.`
+  await vi.waitFor(
+    () => {
+      const ready = readdirSync(directory).filter((name) => name.startsWith(prefix) && name.endsWith('.ready'))
+      expect(ready).toHaveLength(1)
+      expect(readFileSync(join(directory, ready[0]!), 'utf8')).toBe('ready')
+    },
+    { timeout: Math.max(1, deadlineAt - Date.now()) },
+  )
+}
 
 it('refreshes member controls during a running lead, retries metadata failures and opens the native sidebar', async () => {
   const host = await launchAdapterWorld({ teams: true })
   let browser: TestBrowser | undefined
+  let setup: ReturnType<typeof installTeamFixtureApprovals> | undefined
+  const permissionGate = join(host.workspaceCwd, 'teams-controls-permission.ready')
   try {
     await host.ctx.settings.replace('dsh-acp-adapter', {
       agents: {
@@ -18,7 +37,14 @@ it('refreshes member controls during a running lead, retries metadata failures a
           name: 'ACP controls',
           command: process.execPath,
           args: [join(root, 'test/mock-agent/mock-agent.ts')],
-          env: { HOME: host.workspaceCwd, MOCK_SCENARIO: 'regression', MOCK_PROFILE: 'devin', MOCK_MCP_HTTP: '1' },
+          env: {
+            HOME: host.workspaceCwd,
+            MOCK_SCENARIO: 'regression',
+            MOCK_PROFILE: 'devin',
+            MOCK_MCP_HTTP: '1',
+            MOCK_TEAM_PERMISSION_GATE: permissionGate,
+            MOCK_SESSION_NEW_DELAY_MS: '3000',
+          },
         },
       },
     })
@@ -32,13 +58,25 @@ it('refreshes member controls during a running lead, retries metadata failures a
     const initialTurn = host.whenTurnSettled(30_000)
     await writeComposerDraft(page, page.locator('[data-composer-input]').first(), 'E2E_MESSAGE')
     await page.getByRole('button', { name: 'Send message', exact: true }).click()
-    await initialTurn
+    const lead = required(host.ctx.agents.get(await initialTurn))
     await expect.poll(() => page.locator('[data-acp-team-management]').count()).toBe(0)
     const service = host.ctx.get('dshAcp') as AcpRemoteService
     const input = page.locator('[data-composer-input]').first()
+    setup = installTeamFixtureApprovals(host, {
+      root: lead,
+      entries: [...teamStartSteps(host), ...teamMemberSetupSteps('calculator')],
+    })
+    const setupDeadline = Date.now() + 30_000
     await writeComposerDraft(page, input, 'E2E_TEAM_START_HOLD')
     await page.getByRole('button', { name: 'Send message', exact: true }).click()
     await page.getByText('E2E_TEAM_READY', { exact: true }).waitFor()
+    await waitForMemberSetup(permissionGate, setupDeadline)
+    expect(
+      acpPermissionAudit(host, 'decided').filter((entry) => setup!.requestIds.has(entry.data.requestId)),
+    ).toHaveLength(17)
+    setup.finish()
+    setup = undefined
+    writeFileSync(permissionGate, 'ready')
     await page.getByRole('button', { name: 'Stop generating', exact: true }).first().waitFor()
     const trigger = page.getByRole('button', { name: 'Manage members · 1', exact: true })
     await trigger.waitFor()
@@ -79,6 +117,7 @@ it('refreshes member controls during a running lead, retries metadata failures a
     )
     expect(await trigger.evaluate((el) => el === document.activeElement)).toBe(true)
   } finally {
+    setup?.dispose()
     await browser?.close()
     await host.close()
   }
@@ -87,6 +126,8 @@ it('refreshes member controls during a running lead, retries metadata failures a
 it('follows the native Teams bundle and UI lifecycle while retaining the same conversation and roster', async () => {
   const host = await launchAdapterWorld({ optionalBundles: ['agent-team-profile'] })
   let browser: TestBrowser | undefined
+  let setup: ReturnType<typeof installTeamFixtureApprovals> | undefined
+  const permissionGate = join(host.workspaceCwd, 'teams-lifecycle-permission.ready')
   const errors: string[] = []
   try {
     const manager = host.ctx.pluginManager
@@ -101,7 +142,16 @@ it('follows the native Teams bundle and UI lifecycle while retaining the same co
           name: 'ACP Teams lifecycle',
           command: process.execPath,
           args: [join(root, 'test/mock-agent/mock-agent.ts')],
-          env: { HOME: host.workspaceCwd, MOCK_SCENARIO: 'regression', MOCK_PROFILE: 'devin', MOCK_MCP_HTTP: '1' },
+          env: {
+            HOME: host.workspaceCwd,
+            MOCK_SCENARIO: 'regression',
+            MOCK_PROFILE: 'devin',
+            MOCK_MCP_HTTP: '1',
+            MOCK_TEAM_PERMISSION_GATE: permissionGate,
+            // Force the child to start after the Lead's spawn result and READY
+            // message, rather than relying on a fast local session/new.
+            MOCK_SESSION_NEW_DELAY_MS: '3000',
+          },
         },
       },
     })
@@ -135,8 +185,43 @@ it('follows the native Teams bundle and UI lifecycle while retaining the same co
     await vi.waitFor(() => expect(host.ctx.get('agentTeams')).toBeDefined())
     await nativeTeam.waitFor()
     await expect.poll(() => management.count()).toBe(0)
+    setup = installTeamFixtureApprovals(host, {
+      root: lead,
+      entries: [...teamStartSteps(host), ...teamMemberSetupSteps('calculator')],
+    })
+    const setupDeadline = Date.now() + 30_000
     await send('E2E_TEAM_START')
     await page.getByText('E2E_TEAM_READY', { exact: true }).waitFor({ timeout: 30000 })
+    await waitForMemberSetup(permissionGate, setupDeadline)
+    expect(
+      acpPermissionAudit(host, 'decided').filter((entry) => setup!.requestIds.has(entry.data.requestId)),
+    ).toHaveLength(17)
+    setup.finish()
+    setup = undefined
+    // Resolve the real child request explicitly before exercising the Teams
+    // lifecycle. Generic managed-child approvals are independent of Teams UI.
+    const child = required(host.ctx.agentTeams.listMembers(lead).find((member) => member.name === 'calculator'))
+    const childAgent = required(host.ctx.agents.get(child.id))
+    writeFileSync(permissionGate, 'ready')
+    const childApproval = approvals.locator('[data-team-pending-member="calculator"]')
+    await childApproval.getByRole('button', { name: 'Reject', exact: true }).waitFor()
+    expect(
+      acpPermissionAudit(host, 'decided').filter(
+        (entry) => entry.sessionId === child.id && entry.data.toolCallId === 'member-shell',
+      ),
+    ).toEqual([])
+    await childApproval.getByRole('button', { name: 'Reject', exact: true }).click()
+    await expect
+      .poll(
+        () =>
+          acpPermissionAudit(host, 'decided').find(
+            (entry) => entry.sessionId === child.id && entry.data.toolCallId === 'member-shell',
+          )?.data,
+      )
+      .toMatchObject({ optionId: 'deny', selectedOptionKind: 'reject_once' })
+    await childAgent.whenIdle()
+    await lead.whenIdle()
+    await expect.poll(() => approvals.count()).toBe(0)
     const trigger = page.getByRole('button', { name: 'Manage members · 1', exact: true })
     await trigger.waitFor()
     await trigger.click()
@@ -185,6 +270,7 @@ it('follows the native Teams bundle and UI lifecycle while retaining the same co
     expect(page.url()).toBe(url)
     expect(errors).toEqual([])
   } finally {
+    setup?.dispose()
     await browser?.close()
     await host.close()
   }
