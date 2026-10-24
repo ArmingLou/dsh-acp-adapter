@@ -56,6 +56,10 @@ export interface AcpNativeApprovalService {
     readonly callId?: unknown
     readonly reason?: string
     readonly signal?: AbortSignal
+    /** Tool input at the approval boundary, after runtime normalization; absent when not supplied here. */
+    readonly toolArgs?: unknown
+    /** Recognized string command from execute input at this boundary; absent for other or unrecognized inputs. */
+    readonly commandLine?: string
   }): Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'>
 }
 export interface AcpNativePermissionBridgeDeps {
@@ -198,7 +202,11 @@ function nativePermissionReason(tool: acp.RequestPermissionRequest['toolCall'], 
     .join('\n')
 }
 /** Keep targets and unknown scope visible; verified Team task prose stays in raw-request details. */
-function permissionQuestionFacts(tool: acp.RequestPermissionRequest['toolCall'], copy: PermissionCopy): string {
+function permissionQuestionFacts(
+  tool: acp.RequestPermissionRequest['toolCall'],
+  copy: PermissionCopy,
+  profile?: AcpNativeQuestionProfile,
+): string {
   const command = tool.kind === 'execute' ? commandOf(tool) : undefined
   const title = tool.title ?? tool.name
   const lines: string[] = []
@@ -238,6 +246,20 @@ function permissionQuestionFacts(tool: acp.RequestPermissionRequest['toolCall'],
     const commandKey = command === undefined ? undefined : commandKeys.find((key) => record[key] === command)
     const directory = typeof record.cwd === 'string' ? record.cwd : undefined
     if (directory !== undefined) lines.push(`${copy.directory}: ${visibleCommand(directory)}`)
+    if (profile === 'antigravity' && tool.kind === 'execute') {
+      // Presentation normalization retains the wire fields beside command/cwd.
+      // Only remove exact duplicates; conflicting values remain approval facts.
+      if (command !== undefined && record.command === command && record.CommandLine === command)
+        presented.add('CommandLine')
+      if (directory !== undefined && directory.trim() !== '' && record.Cwd === directory) presented.add('Cwd')
+      const wait = record.WaitMsBeforeAsync
+      // Antigravity's run_command schema defines a synchronous wait before
+      // backgrounding, up to 10000 ms; this is not a command execution deadline.
+      if (typeof wait === 'number' && Number.isInteger(wait) && wait >= 0 && wait <= 10_000) {
+        lines.push(copy.backgroundWait(wait))
+        presented.add('WaitMsBeforeAsync')
+      }
+    }
     const fileContent = typeof record.file_path === 'string' && typeof record.content === 'string'
     if (fileContent) {
       lines.push(`${copy.filePath}: ${visibleCommand(record.file_path as string)}`)
@@ -383,10 +405,13 @@ export function createAcpNativePermissionHandler(
 
     if (!nativeInteractionQuestion && deps.approval !== undefined && binary !== undefined) {
       try {
+        const commandLine = params.toolCall.kind === 'execute' ? commandOf(params.toolCall) : undefined
         const outcome = await deps.approval.request({
           agent,
           toolName: params.toolCall.name ?? params.toolCall.kind ?? copy.acpTool,
           callId: params.toolCall.toolCallId,
+          ...(params.toolCall.rawInput === undefined ? {} : { toolArgs: params.toolCall.rawInput }),
+          ...(commandLine === undefined ? {} : { commandLine }),
           reason: [
             nativePermissionReason(params.toolCall, copy),
             `${copy.allowOnce}: ${visibleCommand(binary.allow.name)}`,
@@ -430,7 +455,7 @@ export function createAcpNativePermissionHandler(
             id: questionId,
             question: nativeInteractionQuestion
               ? params.toolCall.title!
-              : permissionQuestionFacts(params.toolCall, copy),
+              : permissionQuestionFacts(params.toolCall, copy, deps.nativeQuestionProfile),
             ...(nativeInteractionQuestion ? {} : { header: copy.permission }),
             ...(detail === undefined ? {} : { detail }),
             options: renderedLabels.map((label) => ({ label })),
