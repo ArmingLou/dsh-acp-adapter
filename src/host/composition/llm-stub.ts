@@ -50,7 +50,11 @@ import type {
 } from '../../protocol/v1/types.ts'
 import type { AcpSpawnPlanView } from '../../runtime/process/types.ts'
 import type { SubprocessSeamResolution } from '../../runtime/process/subprocess.ts'
-import { normalizeAcpConfigOptionKey } from '../../contract/config-options.ts'
+import {
+  ACP_DEFAULT_EFFORT_ID,
+  ACP_DEFAULT_EFFORT_NAME,
+  normalizeAcpConfigOptionKey,
+} from '../../contract/config-options.ts'
 import { redactSecretText } from '../../domain/observability/redaction.ts'
 
 // probe 缓存键的真源下沉到 domain/session/agent-config.ts（remote/创建门
@@ -181,7 +185,8 @@ export function reasoningInfoFromConfigOptions(
   _config: AcpStubAgentConfig,
   configOptions: readonly acp.SessionConfigOption[] | undefined,
 ): LlmModelReasoningInfo | undefined {
-  const option = configOptions?.find((candidate) => {
+  if (configOptions === undefined) return undefined
+  const option = configOptions.find((candidate) => {
     if (candidate.type !== 'select') return false
     const id = candidate.id.toLowerCase().replaceAll('-', '_')
     return (
@@ -191,25 +196,41 @@ export function reasoningInfoFromConfigOptions(
       id === 'reasoning_effort'
     )
   })
-  if (option === undefined || option.type !== 'select') return undefined
   const seen = new Set<string>()
-  const efforts = option.options
-    .flatMap((entry) => ('options' in entry ? entry.options : [entry]))
-    .filter((entry) => {
-      if (seen.has(entry.value)) return false
-      seen.add(entry.value)
-      return entry.value.length > 0 && entry.name.length > 0
-    })
-    .map((entry) => ({
-      id: ReasoningEffortId(entry.value),
-      name: entry.name,
-      ...(entry.description === undefined || entry.description === null ? {} : { description: entry.description }),
-    }))
-  if (efforts.length === 0) return undefined
-  const current = String(option.currentValue)
+  const efforts =
+    option === undefined || option.type !== 'select'
+      ? []
+      : option.options
+          .flatMap((entry) => ('options' in entry ? entry.options : [entry]))
+          .filter((entry) => {
+            if (seen.has(entry.value)) return false
+            seen.add(entry.value)
+            return entry.value.length > 0 && entry.name.length > 0
+          })
+          .map((entry) => ({
+            id: ReasoningEffortId(entry.value),
+            name: entry.name,
+            ...(entry.description === undefined || entry.description === null
+              ? {}
+              : { description: entry.description }),
+          }))
+  // The Agent advertises a control surface but no level for this model. Without
+  // an entry the picker renders no effort control at all, so a session that
+  // already carries an effort for this model has no way to clear it and the
+  // Host rejects every request before the adapter runs. The explicit "no
+  // override" entry is appended to every ACP catalog so that a selection made
+  // under one model stays valid after switching to another.
+  const defaulted = efforts.length === 0
+  if (!seen.has(ACP_DEFAULT_EFFORT_ID))
+    efforts.push({ id: ReasoningEffortId(ACP_DEFAULT_EFFORT_ID), name: ACP_DEFAULT_EFFORT_NAME })
+  const current = option === undefined || option.type !== 'select' ? undefined : String(option.currentValue)
   return {
     efforts,
-    ...(efforts.some((effort) => effort.id === current) ? { defaultEffort: ReasoningEffortId(current) } : {}),
+    ...(defaulted
+      ? { defaultEffort: ReasoningEffortId(ACP_DEFAULT_EFFORT_ID) }
+      : current !== undefined && efforts.some((effort) => effort.id === current)
+        ? { defaultEffort: ReasoningEffortId(current) }
+        : {}),
   }
 }
 
@@ -471,10 +492,10 @@ export class AcpStubAdapter extends LlmAdapter {
       const preparer = this.options.prepareProbe
       preparation = preparer === undefined ? undefined : await preparer({ provider, config, argv })
       const runtimeId = effectiveRuntimeOf(provider.replace(/^acp-/, ''), config)
-      // Kimi and Codex both expose reasoning choices that vary by model. Capture
-      // the confirmed options from the disposable probe session so DSH does not
-      // offer a level (for example Codex Mini + Ultra) that the live session
-      // would immediately reject.
+      // Reasoning choices are Agent-defined and can vary by model (Kimi, Codex,
+      // qoder). Capture the confirmed options from the disposable probe session
+      // so DSH does not offer a level (Codex Mini + Ultra, qoder `high` under
+      // `qfmodel`) that the live session would immediately reject.
       const modelDiscovery = modelProbeOptions(runtimeId)
       const probe = await AcpClientConnection.probe(
         preparation === undefined

@@ -85,7 +85,11 @@ import { createQwenQuestionHandler } from '../../domain/policy/qwen-question.ts'
 import { QWEN_TASK_JOB_KIND, type QwenTaskJobStarter } from '../../runtime/session/qwen-background.ts'
 import type { AcpPromptOptions } from '../../runtime/session/session-runtime.ts'
 import type { AcpNativeQuestionUnavailable, AcpNativeUserQuestionService } from '../../domain/policy/elicitation.ts'
-import { isAcpModelOrReasoningOption, normalizeAcpConfigOptionKey } from '../../contract/config-options.ts'
+import {
+  ACP_DEFAULT_EFFORT_ID,
+  isAcpModelOrReasoningOption,
+  normalizeAcpConfigOptionKey,
+} from '../../contract/config-options.ts'
 import { AcpClientError } from '../../protocol/v1/errors.ts'
 import {
   assertHostExecutionQuiescent,
@@ -1852,9 +1856,16 @@ export class AcpProfileAdapter extends LlmAdapter {
         throw new LlmError(`ACP agent did not confirm configuration "${option.id}"`, 'ACP_CONFIG_SYNC_FAILED')
       }
     }
-    if (!modelChanged && options.reasoningEffort === undefined) return
+    // `acp-default` is the adapter-owned "no override" entry the picker offers
+    // on every ACP model: it must never be written to the Agent, and it must
+    // not count as a requested effort when judging whether this turn has one.
+    const requestedEffort =
+      options.reasoningEffort === undefined || String(options.reasoningEffort) === ACP_DEFAULT_EFFORT_ID
+        ? undefined
+        : options.reasoningEffort
+    if (!modelChanged && requestedEffort === undefined) return
     if (modelChanged) await applyOption(modelOption, options.model)
-    if (options.reasoningEffort === undefined) return
+    if (requestedEffort === undefined) return
     // A model change can change the available reasoning values. Always inspect
     // the confirmed response snapshot rather than the pre-change object.
     const confirmedSnapshot = runtime.configOptions
@@ -1862,7 +1873,7 @@ export class AcpProfileAdapter extends LlmAdapter {
       throw new LlmError('ACP agent did not return a configuration snapshot', 'ACP_CONFIG_SYNC_FAILED')
     const reasoningOption = this.findSelectOption(confirmedSnapshot, 'reasoning')
     try {
-      const requestedReasoning = String(options.reasoningEffort)
+      const requestedReasoning = String(requestedEffort)
       if (
         reasoningOption === undefined ||
         (!reasoningRequestIsCurrent(
@@ -1873,7 +1884,7 @@ export class AcpProfileAdapter extends LlmAdapter {
           !this.selectValues(reasoningOption).has(requestedReasoning))
       ) {
         throw new LlmError(
-          `ACP session does not allow reasoning effort "${String(options.reasoningEffort)}"`,
+          `ACP session does not allow reasoning effort "${requestedReasoning}"`,
           'ACP_CONFIG_UNSUPPORTED',
         )
       }

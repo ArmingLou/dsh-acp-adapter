@@ -6,14 +6,21 @@ export function executableOverrideEnvFor(runtime: AcpAgentId | undefined): strin
   return runtime === 'claude' ? 'CLAUDE_CODE_EXECUTABLE' : runtime === 'antigravity' ? 'REFINED_AGY_ACP_BIN' : undefined
 }
 
-/** These Agents advertise different reasoning choices after selecting each model. */
+/**
+ * Per-model configuration discovery is always attempted. A reasoning catalogue
+ * is Agent-defined, not runtime-branded: probes show qoder answering
+ * `[high, max, low, none]` for `dfmodel` but `[xhigh, low, medium, none]` for
+ * `qfmodel`, and a picker fed only the first session's list offers `high` for a
+ * model that rejects it. Discovery stays cheap for invariant catalogues — it
+ * writes one config value per model on the probe session and creates extra
+ * sessions only once an independent control is observed.
+ */
 export function modelProbeOptions(runtime: AcpAgentId | undefined): {
   probeModelConfigOptions: boolean
   probeModelConfigConcurrency: number
 } {
   return {
-    probeModelConfigOptions:
-      runtime === 'devin' || runtime === 'kimi' || runtime === 'codex' || runtime === 'antigravity',
+    probeModelConfigOptions: true,
     probeModelConfigConcurrency: runtime === 'devin' ? 8 : 1,
   }
 }

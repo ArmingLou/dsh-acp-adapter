@@ -38,7 +38,7 @@ const effortOption = (
 describe('ACP catalog reasoning metadata', () => {
   it.each(['codex', 'claude', 'kimi', 'devin'])('maps %s thought_level to DSH reasoning metadata', (profileId) => {
     const info = reasoningInfoFromConfigOptions(profileId, config, [effortOption()])
-    expect(info?.efforts.map((effort) => effort.id)).toEqual(['low', 'high', 'max'])
+    expect(info?.efforts.map((effort) => effort.id)).toEqual(['low', 'high', 'max', 'acp-default'])
     expect(info?.defaultEffort).toBe('high')
     expect(info?.efforts[0]?.name).toBe('Low')
   })
@@ -48,36 +48,42 @@ describe('ACP catalog reasoning metadata', () => {
       effortOption(undefined, 'max', 'reasoning_effort'),
     ])
     expect(info?.defaultEffort).toBe('max')
-    expect(info?.efforts.map((effort) => effort.name)).toEqual(['Low', 'High', 'Max'])
+    expect(info?.efforts.map((effort) => effort.name)).toEqual(['Low', 'High', 'Max', 'ACP default'])
   })
 
-  it('does not invent reasoning controls for legacy Devin model variants', () => {
-    expect(
-      reasoningInfoFromConfigOptions('devin', config, [
-        {
-          id: 'model',
-          name: 'Model',
-          category: 'model',
-          type: 'select',
-          currentValue: 'swe-medium',
-          options: [
-            { value: 'swe-medium', name: 'SWE Medium' },
-            { value: 'swe-high', name: 'SWE High' },
-          ],
-        },
-      ]),
-    ).toBeUndefined()
+  it('offers only the no-override entry for a model the Agent gives no level', () => {
+    // A level-less model still needs one selectable entry: otherwise a session
+    // carrying a pinned effort has no control to clear it, and the Host rejects
+    // every request for that model before the adapter is ever called.
+    const info = reasoningInfoFromConfigOptions('devin', config, [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: 'swe-medium',
+        options: [
+          { value: 'swe-medium', name: 'SWE Medium' },
+          { value: 'swe-high', name: 'SWE High' },
+        ],
+      },
+    ])
+    expect(info?.efforts.map((effort) => effort.id)).toEqual(['acp-default'])
+    expect(info?.defaultEffort).toBe('acp-default')
   })
 
-  it('omits an empty or unknown option and does not invent a default', () => {
+  it('keeps the no-override entry and does not invent a default for an empty or unknown option', () => {
     expect(
       reasoningInfoFromConfigOptions('codex', config, [
         { id: 'x', name: 'X', type: 'select', currentValue: 'x', options: [] },
-      ]),
-    ).toBeUndefined()
-    expect(reasoningInfoFromConfigOptions('codex', config, [effortOption('other', 'missing', 'other')])).toEqual(
-      undefined,
-    )
+      ])?.efforts.map((effort) => effort.id),
+    ).toEqual(['acp-default'])
+    expect(reasoningInfoFromConfigOptions('codex', config, [effortOption('other', 'missing', 'other')])).toEqual({
+      efforts: [{ id: 'acp-default', name: 'ACP default' }],
+      defaultEffort: 'acp-default',
+    })
+    // An Agent that discloses no control surface at all keeps the picker empty.
+    expect(reasoningInfoFromConfigOptions('codex', config, undefined)).toBeUndefined()
   })
 
   it('keeps probe snapshots bounded and removes metadata/secret text', () => {

@@ -292,7 +292,22 @@ export class CrossBackendCoordinator {
             sessionId: ticket.sourceSessionId as SessionId,
             ...selection,
           })
-          return result.ok ? { ok: true } : { ok: false, message: result.error.message }
+          if (result.ok) return { ok: true }
+          // A source session can carry an effort its model no longer advertises
+          // (an ACP model that reports no reasoning catalogue, or a pinned
+          // profile default such as `reasoningEffort: high`). The host rejects
+          // that selection before any adapter call, which would strand the
+          // decision modal as unconfirmable and make cancel fail the same way.
+          // The effort is not part of the model identity, so retry the same
+          // provider/model without it: the source model is what must be
+          // restored, and the host then applies the model's own default.
+          if (selection.reasoningEffort === undefined) return { ok: false, message: result.error.message }
+          const restored = await remote.session.selectModel({
+            sessionId: ticket.sourceSessionId as SessionId,
+            provider: selection.provider,
+            model: selection.model,
+          })
+          return restored.ok ? { ok: true } : { ok: false, message: result.error.message }
         } catch (error) {
           return { ok: false, message: error instanceof Error ? error.message : String(error) }
         }

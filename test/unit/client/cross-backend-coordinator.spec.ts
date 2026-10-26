@@ -260,6 +260,39 @@ describe('cross-backend coordinator', () => {
     stop()
   })
 
+  it('restores the source model without a stale effort its model no longer advertises', async () => {
+    const f = fixture({
+      projection: {
+        lastUsed: { provider: 'acp-deveco', model: 'deveco/GLM-5.1', reasoningEffort: 'high' },
+        next: { provider: 'acp-codebuddy-code', model: 'deepseek-v4.1-flash' },
+      },
+    })
+    // The host rejects an effort the model does not advertise before any adapter
+    // call, so staging must fall back to the bare model identity instead of
+    // leaving the decision modal unconfirmable and cancel looping.
+    f.remote.session.selectModel.mockResolvedValueOnce({
+      ok: false,
+      error: { message: 'provider "acp-deveco" model "deveco/GLM-5.1" does not support reasoning effort "high"' },
+    })
+    const stop = f.coordinator.start()
+    await settle()
+    expect(f.remote.session.selectModel).toHaveBeenNthCalledWith(1, {
+      sessionId: 'session-1',
+      provider: 'acp-deveco',
+      model: 'deveco/GLM-5.1',
+      reasoningEffort: 'high',
+    })
+    expect(f.remote.session.selectModel).toHaveBeenNthCalledWith(2, {
+      sessionId: 'session-1',
+      provider: 'acp-deveco',
+      model: 'deveco/GLM-5.1',
+    })
+    const pending = f.coordinator.getSnapshot().pending
+    expect(pending?.failure).toBeNull()
+    expect(pending?.confirmable).toBe(true)
+    stop()
+  })
+
   it('does not read modelDirectories while observing a native or ACP transition', () => {
     const f = fixture({
       projection: {
