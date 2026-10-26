@@ -6,6 +6,12 @@ import {
 
 type Selection = { provider: string; model: string; reasoningEffort?: string }
 const owns = (provider: string | undefined): boolean => provider?.startsWith('acp-') === true
+const transcriptLabels = {
+  header: 'CARRIED TRANSCRIPT HEADER',
+  truncated: 'EARLIER HISTORY TRUNCATED',
+  user: 'User',
+  assistant: 'Assistant',
+}
 const settle = async (): Promise<void> => {
   await Promise.resolve()
   await Promise.resolve()
@@ -37,6 +43,7 @@ function fixture(
   } = {},
 ) {
   const sessionId = options.sessionId ?? 'session-1'
+  const order: string[] = []
   const projection = observable(
     options.projection ?? {
       lastUsed: { provider: 'native', model: 'model-a' },
@@ -52,13 +59,54 @@ function fixture(
       },
     },
   })
-  const bindings = new Map([[sessionId, { session: { projections: { faceOf: () => projection } } }]])
+  const transcript = observable<{ entries: readonly unknown[]; hasMore: boolean }>({ entries: [], hasMore: false })
+  const prompt = vi.fn(
+    async (
+      _content: readonly { type: string; text: string }[],
+      _mode: 'queue' | 'steer',
+    ): Promise<{ ok: boolean; error?: { message: string } }> => {
+      order.push('prompt')
+      return { ok: true }
+    },
+  )
+  const destination = { blank: true }
+  const bindingFor = (
+    modelProjection: unknown,
+    events: {
+      getSnapshot: () => { entries: readonly unknown[]; hasMore: boolean }
+      subscribe: (listener: () => void) => () => void
+    } = transcript,
+    blank = false,
+  ) => ({
+    eventSource: events,
+    session: {
+      projections: { faceOf: () => modelProjection },
+      prompt,
+      getSnapshot: () => ({ blank, promptAttempted: false }),
+    },
+  })
+  const bindings = new Map([[sessionId, bindingFor(projection)]])
   const sessionBinding = (id: string) => bindings.get(id)
   const sessions = {
     list,
     binding: sessionBinding,
     create: vi.fn(async () => 'destination'),
-    open: vi.fn(),
+    subagentAddress: vi.fn(() => undefined as unknown),
+    using: vi.fn(
+      async (
+        id: string,
+        _options: unknown,
+        operation: (reference: { binding: ReturnType<typeof bindingFor> }) => unknown,
+      ) => {
+        const binding =
+          bindings.get(id) ?? bindingFor(observable({ lastUsed: null, next: null }), transcript, destination.blank)
+        bindings.set(id, binding)
+        return operation({ binding })
+      },
+    ),
+    open: vi.fn(() => {
+      order.push('open')
+    }),
   }
   const remote = {
     session: {
@@ -86,8 +134,13 @@ function fixture(
     modelDirectories,
     sessions,
     bindings,
+    bindingFor,
     list,
+    order,
     projection,
+    prompt,
+    transcript,
+    destination,
     coordinator: new CrossBackendCoordinator(ctx, owns),
   }
 }
@@ -345,6 +398,45 @@ describe('cross-backend coordinator', () => {
     stop()
   })
 
+  it('keeps the decision confirmable when the source model cannot be restored', async () => {
+    const f = fixture({
+      projection: {
+        lastUsed: { provider: 'buddy', model: 'step-5-preview' },
+        next: { provider: 'acp-qoder', model: 'qfmodel' },
+      },
+    })
+    // A retired model makes the restore permanently impossible; creating the
+    // destination never depended on it, so the modal must stay actionable.
+    f.remote.session.selectModel.mockResolvedValueOnce({
+      ok: false,
+      error: { message: 'Select an available model before sending a message.' },
+    })
+    const stop = f.coordinator.start()
+    await settle()
+    const pending = f.coordinator.getSnapshot().pending
+    expect(pending?.confirmable).toBe(true)
+    expect(pending?.ticket.sourceRestoreFailed).toBe('Select an available model before sending a message.')
+    stop()
+  })
+
+  it('dismisses the decision when canceling an unrestorable source', async () => {
+    const f = fixture({
+      projection: {
+        lastUsed: { provider: 'buddy', model: 'step-5-preview' },
+        next: { provider: 'acp-qoder', model: 'qfmodel' },
+      },
+    })
+    f.remote.session.selectModel.mockResolvedValue({ ok: false, error: { message: 'no such model' } })
+    const stop = f.coordinator.start()
+    await settle()
+    expect(f.coordinator.getSnapshot().pending).not.toBeNull()
+    await f.coordinator.cancel()
+    // The dismissed decision must not bounce back: the modal closes and the
+    // observer sees no new selection to stage.
+    expect(f.coordinator.getSnapshot().pending).toBeNull()
+    stop()
+  })
+
   it.each([
     ['create-destination', 'create'],
     ['select-destination', 'select'],
@@ -378,7 +470,7 @@ describe('cross-backend coordinator', () => {
       lastUsed: { provider: 'native', model: 'child-old' },
       next: { provider: 'native', model: 'child-old' },
     })
-    f.bindings.set('child', { session: { projections: { faceOf: () => child } } })
+    f.bindings.set('child', f.bindingFor(child))
     f.list.set({ byId: { ...f.list.getSnapshot().byId, child: { id: 'child', blank: false, cwd: '/child' } } })
     const stop = f.coordinator.start()
     child.set({
@@ -433,6 +525,149 @@ describe('cross-backend coordinator', () => {
       next: { provider: 'acp-devin', model: 'another' },
     })
     expect(f.remote.session.selectModel).toHaveBeenCalledTimes(1)
+    stop()
+  })
+
+  it('never offers the backend decision to a subagent session', async () => {
+    const f = fixture()
+    f.sessions.subagentAddress.mockReturnValue({
+      parentSessionId: 'parent',
+      childSessionId: 'session-1',
+      mode: 'continuable',
+    } as never)
+    const stop = f.coordinator.start()
+    f.projection.set({
+      lastUsed: { provider: 'native', model: 'model-a' },
+      next: { provider: 'acp-codex', model: 'new' },
+    })
+    await settle()
+    expect(f.coordinator.getSnapshot().pending).toBeNull()
+    expect(f.sessions.create).not.toHaveBeenCalled()
+    stop()
+  })
+
+  it('carries text-only conversation into the destination before opening it when opted in', async () => {
+    const f = fixture()
+    f.transcript.set({
+      entries: [
+        {
+          type: 'event',
+          event: {
+            type: 'user/message',
+            seq: 1,
+            time: 1,
+            data: {
+              source: { kind: 'user' },
+              content: [
+                { type: 'text', text: 'hello there' },
+                { type: 'image', attachment: { id: 'attachment-1' } },
+              ],
+            },
+          },
+        },
+        // Injected context shares the user role but is not conversation text.
+        {
+          type: 'event',
+          event: {
+            type: 'user/message',
+            seq: 2,
+            time: 2,
+            data: { source: { kind: 'notice' }, content: [{ type: 'text', text: 'file changed' }] },
+          },
+        },
+        // Live transient chunks never reach the durable transcript.
+        { type: 'transient', event: { type: 'assistant/live-chunk', seq: 3, time: 3, data: {} } },
+        {
+          type: 'event',
+          event: {
+            type: 'assistant/message',
+            seq: 4,
+            time: 4,
+            data: {
+              message: {
+                content: [
+                  { type: 'reasoning', text: 'private chain' },
+                  { type: 'text', text: 'the answer' },
+                  { type: 'tool-call', id: 'call-1', name: 'bash', arguments: '{"command":"ls"}' },
+                ],
+              },
+            },
+          },
+        },
+      ],
+      hasMore: true,
+    })
+    const stop = f.coordinator.start()
+    f.projection.set({
+      lastUsed: { provider: 'native', model: 'model-a' },
+      next: { provider: 'acp-codex', model: 'new' },
+    })
+    await settle()
+
+    f.coordinator.setCarryTranscript(transcriptLabels)
+    await f.coordinator.confirm()
+
+    const call = f.prompt.mock.calls[0]!
+    const text = call[0][0]!.text
+    expect(call[1]).toBe('queue')
+    expect(text.startsWith(transcriptLabels.header)).toBe(true)
+    expect(text).toContain('User: hello there')
+    expect(text).toContain('Assistant: the answer')
+    expect(text).toContain(transcriptLabels.truncated)
+    expect(text).not.toContain('private chain')
+    expect(text).not.toContain('file changed')
+    expect(text).not.toContain('attachment-1')
+    expect(text).not.toContain('bash')
+    // The first turn is written before the destination is opened.
+    expect(f.order).toEqual(['prompt', 'open'])
+    stop()
+  })
+
+  it('writes nothing when the user keeps the default (handoff off)', async () => {
+    const f = fixture()
+    const stop = f.coordinator.start()
+    f.projection.set({
+      lastUsed: { provider: 'native', model: 'model-a' },
+      next: { provider: 'acp-codex', model: 'new' },
+    })
+    await settle()
+    await f.coordinator.confirm()
+    expect(f.prompt).not.toHaveBeenCalled()
+    expect(f.sessions.open).toHaveBeenCalledTimes(1)
+    stop()
+  })
+
+  it('reports a failed transcript write as a retryable carry-transcript failure', async () => {
+    const f = fixture()
+    f.transcript.set({
+      entries: [
+        {
+          type: 'event',
+          event: {
+            type: 'user/message',
+            seq: 1,
+            time: 1,
+            data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello there' }] },
+          },
+        },
+      ],
+      hasMore: false,
+    })
+    f.prompt.mockResolvedValueOnce({ ok: false, error: { message: 'PROMPT_REJECTED' } })
+    const stop = f.coordinator.start()
+    f.projection.set({
+      lastUsed: { provider: 'native', model: 'model-a' },
+      next: { provider: 'acp-codex', model: 'new' },
+    })
+    await settle()
+    f.coordinator.setCarryTranscript(transcriptLabels)
+    await f.coordinator.confirm()
+
+    expect(f.coordinator.getSnapshot().pending?.failure).toMatchObject({
+      phase: 'carry-transcript',
+      message: 'PROMPT_REJECTED',
+    })
+    expect(f.sessions.open).not.toHaveBeenCalled()
     stop()
   })
 })

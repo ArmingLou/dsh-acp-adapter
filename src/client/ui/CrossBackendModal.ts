@@ -1,7 +1,7 @@
 import { createElement as h, useEffect, useState, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
-import { Button, DisclosureRow, IconInfoOutlineMedium, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
-import type { CrossBackendPhase } from '../data/cross-backend-controller.ts'
+import { Button, Checkbox, DisclosureRow, IconInfoOutlineMedium, Modal } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { CrossBackendPhase, CrossBackendTranscriptLabels } from '../data/cross-backend-controller.ts'
 import type { CrossBackendCoordinator } from '../coordinator/cross-backend-coordinator.ts'
 import type { AcpLocaleKey } from './locales.ts'
 import css from './CrossBackendModal.module.css'
@@ -39,9 +39,19 @@ export function CrossBackendModal({
     'restore-source': 'crossBackendFailureRestore',
     'create-destination': 'crossBackendFailureCreate',
     'select-destination': 'crossBackendFailureSelect',
+    'carry-transcript': 'crossBackendFailureTranscript',
     'open-destination': 'crossBackendFailureOpen',
     completed: 'crossBackendFailureUnknown',
   }
+  // Captured when the user opts in: the injected turn is model-facing text, so
+  // its framing follows the language the decision was made in.
+  const transcriptLabels: CrossBackendTranscriptLabels = {
+    header: t('crossBackendTranscriptHeader'),
+    truncated: t('crossBackendTranscriptTruncated'),
+    user: t('crossBackendTranscriptUser'),
+    assistant: t('crossBackendTranscriptAssistant'),
+  }
+  const carryTranscript = pending.ticket.carryTranscript !== undefined
   const error =
     pending.failure !== null
       ? t(phaseKey[pending.failure.phase])
@@ -88,6 +98,16 @@ export function CrossBackendModal({
         ),
       ),
     },
+    h(
+      'div',
+      { className: css.options },
+      h(Checkbox, {
+        checked: carryTranscript,
+        disabled: pending.busy || !pending.confirmable,
+        label: t('crossBackendTranscriptOption'),
+        onChange: (next: boolean) => coordinator.setCarryTranscript(next ? transcriptLabels : undefined),
+      }),
+    ),
     error === null
       ? null
       : h(

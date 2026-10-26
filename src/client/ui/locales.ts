@@ -401,13 +401,19 @@ const zh = {
   crossBackendContinue: '继续',
   crossBackendWorking: '处理中…',
   crossBackendNoLocation: '找不到新会话的工作区或工作目录。',
-  crossBackendFailureRestore: '无法恢复当前会话原先使用的模型',
+  crossBackendFailureRestore: '无法还原上一个模型（它可能已不可用）；当前会话会保持切换后的选择。',
   crossBackendFailureCreate: '无法创建新会话',
   crossBackendFailureSelect: '无法为新会话选择模型',
+  crossBackendFailureTranscript: '无法把当前对话的文本转录写入新会话',
   crossBackendFailureOpen: '无法打开新会话',
   crossBackendFailureUnknown: '操作失败，请重试',
   crossBackendDiagnostics: '查看技术详情',
   crossBackendFromTo: '将从 {source} 切换到 {target}。',
+  crossBackendTranscriptOption: '把当前对话的文本转录带入新会话（工具调用与附件不迁移）',
+  crossBackendTranscriptHeader: '以下是从上一个后端转述的对话历史（仅文本，工具调用、图片、附件与推理过程均未迁移）。',
+  crossBackendTranscriptTruncated: '（更早的历史已截断）',
+  crossBackendTranscriptUser: '用户',
+  crossBackendTranscriptAssistant: '助手',
   crossBackendExistingHistory:
     '当前对话已有历史，但没有记录可恢复的原模型。继续会在新 DSH 会话中运行智能体并保留原对话；取消后当前会话仍选中该智能体，若要继续原对话，请重新选择模型。',
 } as const
@@ -833,13 +839,22 @@ const en: Record<AcpLocaleKey, string> = {
   crossBackendContinue: 'Continue',
   crossBackendWorking: 'Working…',
   crossBackendNoLocation: 'No workspace or working directory is available for the new session.',
-  crossBackendFailureRestore: 'Could not restore the model used by the current session.',
+  crossBackendFailureRestore:
+    'Could not restore the previous model (it may no longer be available). This session keeps its new selection.',
   crossBackendFailureCreate: 'Could not create the new session.',
   crossBackendFailureSelect: 'Could not select a model for the new session.',
+  crossBackendFailureTranscript: "Could not write the current conversation's text transcript into the new session.",
   crossBackendFailureOpen: 'Could not open the new session.',
   crossBackendFailureUnknown: 'The operation failed. Please retry.',
   crossBackendDiagnostics: 'View technical details',
   crossBackendFromTo: 'Switch from {source} to {target}.',
+  crossBackendTranscriptOption:
+    'Carry this conversation’s text transcript into the new session (tool calls and attachments are not migrated)',
+  crossBackendTranscriptHeader:
+    'The following is a transcript carried over from the previous backend (text only; tool calls, images, attachments and reasoning were not migrated).',
+  crossBackendTranscriptTruncated: '(Earlier history was truncated.)',
+  crossBackendTranscriptUser: 'User',
+  crossBackendTranscriptAssistant: 'Assistant',
   crossBackendExistingHistory:
     'This session has conversation history but no recorded model to restore. Continuing runs the Agent in a new DSH session and keeps the original conversation. Cancel leaves this Agent selected in the current session; choose another model to continue that conversation.',
 }

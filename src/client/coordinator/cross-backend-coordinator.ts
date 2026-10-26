@@ -1,16 +1,30 @@
 /** Additive coordinator for stock DSH model selection transitions. */
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-workspace/client'
-import type { ISessions, SessionBinding } from '@deepseek-ai/dsh-api-session-controller/client'
+import type { ISessions, SessionBinding, SessionEventWindow } from '@deepseek-ai/dsh-api-session-controller/client'
 import type { IWorkspaces } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { TypertClientRemote } from '@deepseek-ai/dsh-typert-protocol'
-import { CrossBackendTransactionController, resolveCrossBackendLocation } from '../data/cross-backend-controller.ts'
+import {
+  CrossBackendTransactionController,
+  buildCrossBackendTranscript,
+  resolveCrossBackendLocation,
+} from '../data/cross-backend-controller.ts'
 import type {
   CrossBackendFailure,
   CrossBackendModelSelection,
+  CrossBackendOperations,
   CrossBackendTicket,
+  CrossBackendTranscriptEntry,
+  CrossBackendTranscriptLabels,
 } from '../data/cross-backend-controller.ts'
+
+declare module '@deepseek-ai/dsh-api-session-controller/client' {
+  interface SessionReferenceSourceMap {
+    /** One cross-backend handoff: read the source transcript, seed the destination's first turn. */
+    crossBackendHandoff: unknown
+  }
+}
 
 type ModelProjection = {
   readonly lastUsed: CrossBackendModelSelection | null
@@ -62,6 +76,38 @@ export function shouldConfirmBackendTransition(
   if (input.blank && input.lastUsed === null && toAcp) return false
   if (fromAcp && toAcp && input.lastUsed?.provider === input.next.provider) return false
   return true
+}
+
+/**
+ * Project the loaded event window into text-only conversation turns.
+ *
+ * Only direct human prompts (`source.kind === 'user'`) and assistant text
+ * blocks are carried: tool calls and results, images, files, reasoning and
+ * injected context all stay behind in the source session.
+ */
+export function crossBackendTranscriptEntries(window: SessionEventWindow): readonly CrossBackendTranscriptEntry[] {
+  const entries: CrossBackendTranscriptEntry[] = []
+  for (const entry of window.entries) {
+    if (entry.type !== 'event') continue
+    const event = entry.event
+    if (event.type === 'user/message') {
+      if (event.data.source.kind !== 'user') continue
+      entries.push({ role: 'user', text: textBlocks(event.data.content) })
+      continue
+    }
+    if (event.type === 'assistant/message') {
+      entries.push({ role: 'assistant', text: textBlocks(event.data.message.content) })
+    }
+  }
+  return entries.filter((entry) => entry.text.length > 0)
+}
+
+function textBlocks(content: readonly { readonly type: string; readonly text?: unknown }[]): string {
+  return content
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text as string)
+    .join('\n')
+    .trim()
 }
 
 interface ObservedSession {
@@ -141,6 +187,21 @@ export class CrossBackendCoordinator {
     return this.snapshot
   }
 
+  /**
+   * Record the user's explicit opt-in for the text handoff. `undefined` is the
+   * default (no handoff) and restores the pre-existing transaction exactly.
+   */
+  setCarryTranscript(labels: CrossBackendTranscriptLabels | undefined): void {
+    const pending = this.pending
+    if (pending === null || this.disposed || pending.busy) return
+    const { carryTranscript: _current, ...rest } = pending.ticket
+    this.pending = {
+      ...pending,
+      ticket: labels === undefined ? rest : { ...rest, carryTranscript: labels },
+    }
+    this.emit()
+  }
+
   async confirm(): Promise<void> {
     const pending = this.pending
     if (pending === null || this.disposed || !pending.confirmable || pending.busy) return
@@ -203,6 +264,11 @@ export class CrossBackendCoordinator {
     )
       return
     const row = sessions.list.getSnapshot().byId[sessionId]
+    // Subagent sessions own no backend decision: DSH refuses Agent-bound model
+    // RPCs for addressed children (the stock picker's `assertAvailable`), and
+    // their transcript belongs to the parent conversation, so neither the modal
+    // nor the text handoff applies to them.
+    if (sessions.subagentAddress(sessionId) !== undefined) return
     if (
       !shouldConfirmBackendTransition(
         {
@@ -269,12 +335,19 @@ export class CrossBackendCoordinator {
           busy: false,
         }
       : {
-          ticket,
+          // The source model cannot be put back (it may no longer be routable).
+          // Creating the destination does not depend on that, so the decision
+          // stays movable and the restore is reported as a warning.
+          ticket: {
+            ...ticket,
+            sourceRestoreFailed: restored.message ?? 'source model restore failed',
+          },
           failure: {
             phase: 'restore-source',
             message: restored.message ?? 'source model restore failed',
           },
-          confirmable: false,
+          ...(blockingReason === undefined ? {} : { blockingReason }),
+          confirmable: blockingReason === undefined,
           busy: false,
         }
     if (this.pending === null) this.pending = pending
@@ -282,7 +355,7 @@ export class CrossBackendCoordinator {
     this.emit()
   }
 
-  private operationsFor(ticket: CrossBackendTicket) {
+  private operationsFor(ticket: CrossBackendTicket): CrossBackendOperations {
     const remote = this.ctx.remote as TypertClientRemote
     const sessions = this.ctx.get('sessions') as unknown as ISessions
     return {
@@ -341,6 +414,41 @@ export class CrossBackendCoordinator {
           return { ok: false, message: error instanceof Error ? error.message : String(error) }
         }
       },
+      carryTranscript: async ({
+        sourceSessionId,
+        destinationSessionId,
+        labels,
+      }: {
+        sourceSessionId: string
+        destinationSessionId: string
+        labels: CrossBackendTranscriptLabels
+      }) => {
+        try {
+          const source = await this.readTranscript(sourceSessionId)
+          const built = buildCrossBackendTranscript(source.entries, labels, source.hasMore)
+          if (built === undefined) return { ok: true, skipped: 'empty-transcript' }
+          return await sessions.using(
+            destinationSessionId as SessionId,
+            { source: 'crossBackendHandoff' },
+            async (reference) => {
+              const session = reference.binding.session
+              // A retry after a lost response must not inject the transcript
+              // twice: an accepted first prompt already cleared blankness.
+              if (!session.getSnapshot().blank) {
+                return { ok: true, skipped: 'destination-not-blank' as const }
+              }
+              // The official prompt channel: one text part becomes the
+              // destination's first user message and its first turn.
+              const result = await session.prompt([{ type: 'text', text: built.text }], 'queue')
+              return result.ok
+                ? { ok: true, messages: built.messages, truncated: built.truncated }
+                : { ok: false, message: result.error.message }
+            },
+          )
+        } catch (error) {
+          return { ok: false, message: error instanceof Error ? error.message : String(error) }
+        }
+      },
       openDestination: async (sessionId: string) => {
         try {
           this.ctx.uiWorkspace.openSession(sessionId as SessionId)
@@ -350,6 +458,29 @@ export class CrossBackendCoordinator {
         }
       },
     }
+  }
+
+  /**
+   * Read the source's loaded event window. The window is what the open
+   * conversation already holds, so `hasMore` truthfully reports that older
+   * turns exist beyond it (they are marked as omitted, never paged in: paging
+   * would mutate the source view the handoff promises to leave unchanged).
+   */
+  private async readTranscript(
+    sessionId: string,
+  ): Promise<{ entries: readonly CrossBackendTranscriptEntry[]; hasMore: boolean }> {
+    const sessions = this.ctx.get('sessions') as unknown as ISessions
+    const read = (binding: SessionBinding) => {
+      const window = binding.eventSource.getSnapshot()
+      return { entries: crossBackendTranscriptEntries(window), hasMore: window.hasMore }
+    }
+    // Borrow the generation an open view already owns; only an unretained
+    // source needs a reference of its own (the user may have navigated away).
+    const existing = sessions.binding(sessionId as SessionId)
+    if (existing !== undefined) return read(existing)
+    return sessions.using(sessionId as SessionId, { source: 'crossBackendHandoff' }, (reference) =>
+      read(reference.binding),
+    )
   }
 
   private emit(): void {

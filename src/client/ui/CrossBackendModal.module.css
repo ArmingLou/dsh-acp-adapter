@@ -10,6 +10,10 @@
   max-width: min(560px, calc(100vw - 32px));
 }
 
+.options {
+  margin-block-end: 12px;
+}
+
 .error {
   margin: 0;
   white-space: pre-wrap;
