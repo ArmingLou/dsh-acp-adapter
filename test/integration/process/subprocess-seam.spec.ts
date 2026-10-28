@@ -244,7 +244,7 @@ describe('依赖面守卫（宿主模块实例一致性 纪律）', () => {
       expect(pkg.dependencies?.[name]).toBeUndefined()
       expect(pkg.peerDependencies?.[name]).toBeUndefined()
       const version = pkg.devDependencies?.[name]
-      expect(version).toBe(pkg.engines.dsh)
+      expect(version).toBe(pkg.devDependencies?.['@deepseek-ai/dsh'])
     }
     expect(
       JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'package.json'), 'utf8')).scripts['verify:dev-install'],

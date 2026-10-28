@@ -34,8 +34,10 @@ function optionalBundleDirectory(bundle: OptionalBundle): string {
     version: string
     dsh?: { bundle?: { patch?: unknown } }
   }
-  const adapter = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { engines: { dsh: string } }
-  if (manifest.version !== adapter.engines.dsh || manifest.dsh?.bundle?.patch === undefined)
+  const adapter = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
+    devDependencies?: Record<string, string>
+  }
+  if (manifest.version !== adapter.devDependencies?.['@deepseek-ai/dsh'] || manifest.dsh?.bundle?.patch === undefined)
     throw new Error(`Optional bundle ${bundle} does not match the pinned published Host`)
   return dirname(manifestPath)
 }

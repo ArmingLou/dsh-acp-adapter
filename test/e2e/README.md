@@ -2,7 +2,7 @@
 
 本目录验证 DSH 与 ACP 的集成行为。浏览器场景启动目标版本的 Loader、真实 ACP 子进程和浏览器，并加载构建后的插件与 DSH UI；源码／jsdom 场景和仅 Host 场景的范围在下文分别说明。协议夹具提供可控 ACP 输入，覆盖 UI 与宿主集成；真实 Agent 行为另由 opt-in 检查验证。Web scaffold 或 Electron 窗口中的适配器检查不等于完整桌面产品的打包、preload、升级或跨平台验收。运行真实 Agent 会使用本机登录和模型额度。
 
-当前运行目标由 `package.json` 的 `engines.dsh` 决定。下文既有真实 Agent 记录只适用于各自记录的版本、平台和场景，不能直接作为当前目标版本的 live 验收。
+当前运行目标由 `package.json` 的 `devDependencies["@deepseek-ai/dsh"]` 精确固定，`engines.dsh` 只声明兼容范围。下文既有真实 Agent 记录只适用于各自记录的版本、平台和场景，不能直接作为当前目标版本的 live 验收。
 
 文件能力分开验收：`native-parity` 的完整 Diff 场景检查 ACP 单次编辑工具卡中的原生 `DiffBlock`，不检查整轮 `ChangedFiles` 摘要；`present` 交付卡、标准 Markdown 文件链接及原生预览也是不同路径。会话流对照需另外观察首输出前、默认折叠、完成、下一次输入和恢复后的状态，不能用结束后统一展开的截图证明全过程一致。
 

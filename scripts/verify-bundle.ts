@@ -16,7 +16,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { PLATFORM_EXTERNALS, PLATFORM_PACKAGES } from './dsh-platform-snapshot.ts'
 import { findMissingRelativeRuntimeImports } from './verify-runtime-closure.ts'
-import { DSH_COMPAT_RANGE, DSH_SOURCE_VERSION } from './dsh-target.ts'
+import { DSH_COMPAT_RANGE, DSH_SOURCE_VERSION, engineRangeAdmits } from './dsh-target.ts'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const read = (rel: string) => readFileSync(join(root, rel), 'utf8')
@@ -116,8 +116,10 @@ for (const spec of declaredExternal) {
 }
 
 // Host compatibility is separate from exact published development dependencies.
-if (pkg.engines?.dsh !== DSH_COMPAT_RANGE) {
-  fail(`package.json: engines.dsh must be ${DSH_COMPAT_RANGE}; found ${pkg.engines?.dsh}`)
+if (typeof pkg.engines?.dsh !== 'string' || !engineRangeAdmits(pkg.engines.dsh, DSH_SOURCE_VERSION)) {
+  fail(
+    `package.json: engines.dsh must be an exact version or a comparator range admitting ${DSH_SOURCE_VERSION}; found ${pkg.engines?.dsh}`,
+  )
 }
 for (const [name, peerRange] of Object.entries(pkg.peerDependencies ?? {})) {
   if (pkg.peerDependenciesMeta?.[name]?.optional !== true) {
