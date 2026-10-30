@@ -266,7 +266,11 @@ export interface AcpProbeResult {
 export interface AcpProbeOptions extends AcpConnectionOptions {
   /** probe 会话的 cwd；缺省建 `os.tmpdir()` 下临时目录并在结束后清理。 */
   cwd?: string
-  /** initialize 与 session/new 各自的超时预算（默认 15s，devin 冷启动实测约 3s）。 */
+  /**
+   * probe 握手超时预算（默认 60s；probe 时同一预算同时覆盖 initialize 与
+   * session/new，见 ./connection.ts `AcpClientConnection.probe` 与
+   * `DEFAULT_PROBE_TIMEOUT_MS`）。devin 冷启动实测约 3s。
+   */
   timeoutMs?: number
   /** Capture the confirmed config snapshot after selecting each advertised
    * model. No prompt is sent and the disposable session is deleted normally. */

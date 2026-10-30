@@ -32,6 +32,7 @@ import * as acp from '@agentclientprotocol/sdk'
 import {
   AcpClientConnection,
   DEFAULT_INITIALIZE_TIMEOUT_MS,
+  DEFAULT_PROBE_TIMEOUT_MS,
   DEFAULT_SESSION_SETUP_TIMEOUT_MS,
   DEFAULT_SESSION_WRITE_TIMEOUT_MS,
 } from '../../../src/protocol/v1/connection.ts'
@@ -1089,7 +1090,7 @@ describe('拆除梯子', () => {
 })
 
 describe(' 全 RPC deadline 与 connection poison（never-resolve 矩阵）', () => {
-  // 测试用小预算（生产默认 30s/15s 太慢）；mock 的 never-resolve 对指定方法永不应答
+  // 测试用小预算（生产默认：probe 60s / 会话建立 30s / initialize 15s 太慢）；mock 的 never-resolve 对指定方法永不应答
   const NEVER_BUDGET_MS = 150
 
   function connectNever(neverMethods: string[], conn: AcpConnectionOptions = {}): MockHandle {
@@ -1118,8 +1119,9 @@ describe(' 全 RPC deadline 与 connection poison（never-resolve 矩阵）', ()
     await expectStopped(conn)
   }
 
-  it('预算常量钉版：initialize 15s / 会话建立类（new/load/resume/list）30s / 会话写类（set-option/set-mode）15s', () => {
+  it('预算常量钉版：initialize 15s / probe 60s / 会话建立类（new/load/resume/list）30s / 会话写类（set-option/set-mode）15s', () => {
     expect(DEFAULT_INITIALIZE_TIMEOUT_MS).toBe(15_000)
+    expect(DEFAULT_PROBE_TIMEOUT_MS).toBe(60_000)
     expect(DEFAULT_SESSION_SETUP_TIMEOUT_MS).toBe(30_000)
     expect(DEFAULT_SESSION_WRITE_TIMEOUT_MS).toBe(15_000)
   })
