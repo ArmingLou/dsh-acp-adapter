@@ -296,55 +296,58 @@ for (const policy of ['ask', 'never'] as const) {
   })
 
   it.each([
-    { optionId: 'allow_always', name: 'Allow Always (risky)', kind: 'allow_always' },
-    { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-    { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
-  ] as const)(`keeps Antigravity $kind selectable without binary approval under ${policy}`, async (selected) => {
-    const f = await fixture()
-    if (policy === 'ask') f.session.append('approval/policy', { policy })
-    const nativeAnswer = vi.fn(async () => 'allowed-once' as const)
-    const audit: AcpPermissionAuditRecord[] = []
-    f.ctx.on('approval/request', nativeAnswer)
-    const options: acp.PermissionOption[] = [
-      { optionId: 'allow_always', name: 'Allow Always (risky)', kind: 'allow_always' },
-      { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
-      { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
-    ]
-    const ask = vi.fn<AcpNativeUserQuestionService['ask']>(async ({ agent, questions }) => {
-      expect(agent).toBe(f.agent)
-      expect(questions[0]!.options).toEqual(options.map(({ name }) => ({ label: name })))
-      expect(questions[0]!.question).toContain('printf APPROVAL_PROBE')
-      expect(questions[0]!.question).toContain('/workspace')
-      return { answers: [{ id: questions[0]!.id, selected: [selected.name] }] }
-    })
-    try {
-      const response = await createAcpNativePermissionHandler({
-        getAgent: () => f.agent,
-        approval: f.approval,
-        userQuestions: { ask },
-        nativeQuestionProfile: 'antigravity',
-        audit: { append: async (record) => void audit.push(record) },
-      })({
-        sessionId: 'acp-complete-options',
-        toolCall: {
-          toolCallId: 'antigravity-command',
-          kind: 'execute',
-          rawInput: { CommandLine: 'printf APPROVAL_PROBE', Cwd: '/workspace', WaitMsBeforeAsync: 5000 },
-        },
-        options,
-      })
-      expect(response).toEqual({ outcome: { outcome: 'selected', optionId: selected.optionId } })
-      expect(ask).toHaveBeenCalledOnce()
-      expect(nativeAnswer).not.toHaveBeenCalled()
-      expect(audit.at(-1)?.data).toMatchObject({
-        decisionVia: 'native-question',
-        optionId: selected.optionId,
-        selectedOptionKind: selected.kind,
-      })
-      expect(f.ctx.approval.overrideOf(f.session)).toBe(policy)
-      expect(f.ctx.sandboxPolicy.resolve({ session: f.session }).mode).toBe('workspace-write')
-    } finally {
-      await f.ctx.fiber.dispose()
-    }
-  })
+    { answer: 'allowed-once' as const, optionId: 'allow' },
+    { answer: 'rejected' as const, optionId: 'deny' },
+    { answer: 'cancelled' as const, optionId: undefined },
+  ])(
+    `maps a complete Antigravity choice set through host approval under ${policy}: $answer`,
+    async ({ answer, optionId }) => {
+      const f = await fixture()
+      if (policy === 'ask') f.session.append('approval/policy', { policy })
+      const nativeAnswer = vi.fn(async (_request: { reason?: string }) => answer)
+      const audit: AcpPermissionAuditRecord[] = []
+      f.ctx.on('approval/request', nativeAnswer)
+      const options: acp.PermissionOption[] = [
+        { optionId: 'allow_always', name: 'Allow Always (risky)', kind: 'allow_always' },
+        { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+      ]
+      const ask = vi.fn<AcpNativeUserQuestionService['ask']>()
+      try {
+        const response = await createAcpNativePermissionHandler({
+          getAgent: () => f.agent,
+          approval: f.approval,
+          userQuestions: { ask },
+          nativeQuestionProfile: 'antigravity',
+          audit: { append: async (record) => void audit.push(record) },
+        })({
+          sessionId: 'acp-complete-options',
+          toolCall: {
+            toolCallId: 'antigravity-command',
+            kind: 'execute',
+            rawInput: { CommandLine: 'printf APPROVAL_PROBE', Cwd: '/workspace', WaitMsBeforeAsync: 5000 },
+          },
+          options,
+        })
+        expect(response).toEqual(
+          optionId === undefined
+            ? { outcome: { outcome: 'cancelled' } }
+            : { outcome: { outcome: 'selected', optionId } },
+        )
+        // The Agent's persistent grant is never returned on the Host's behalf.
+        expect(response).not.toEqual({ outcome: { outcome: 'selected', optionId: 'allow_always' } })
+        expect(ask).not.toHaveBeenCalled()
+        expect(nativeAnswer).toHaveBeenCalledOnce()
+        expect(nativeAnswer.mock.calls[0]![0].reason).toContain('Allow Always (risky) / Allow / Deny')
+        expect(audit.at(-1)?.data).toMatchObject({
+          decisionVia: 'native-approval',
+          ...(optionId === undefined ? {} : { optionId }),
+        })
+        expect(f.ctx.approval.overrideOf(f.session)).toBe(policy)
+        expect(f.ctx.sandboxPolicy.resolve({ session: f.session }).mode).toBe('workspace-write')
+      } finally {
+        await f.ctx.fiber.dispose()
+      }
+    },
+  )
 }

@@ -4,6 +4,24 @@
 
 User-facing changes and upgrade notes. See [GitHub Releases](https://github.com/zaimokuza-yoshiteru/dsh-acp-adapter/releases) for publication dates, exact installation instructions, and checksums. Historical entries were reconstructed from tag diffs; npm packages were not republished.
 
+## 0.2.1-rc.2.5
+
+### 中文
+
+- ACP Agent 的权限请求不再一律单独成卡：选项含「总是允许」的非二元请求改走宿主审批链路，与宿主工具审批用同一套面板与记忆（允许一次 / 本会话总是允许 / 项目允许 / 拒绝），可在同一处处理。
+- 宿主审批只回「允许一次」这一种授权，因此 Agent 侧的 `allow_always` 不落为持久授权；持久性由宿主规则记忆负责，下次同类请求直接免问。
+- 一次性授权绝不升格为持久拒绝：宿主拒绝映射为 `reject_once`，不做 `reject_always` 转换。
+- 授权面板的工具名带上命令类型（如 `execute (cat)`），使「本会话总是允许」只放行同类命令，而不是全部执行类请求。
+- 升级提示：升级前记住的裸 `execute` 工具档不再命中，相关请求会重新询问一次（方向为收紧）。
+
+### English
+
+- ACP agents' permission requests no longer always render as their own card: non-binary requests that offer a persistent tier now route through the host approval chain, sharing its panel and memory (allow once / allow for this session / allow for this project / reject).
+- The host approval chain only returns `allowed-once`, so an agent's `allow_always` is not turned into a persistent grant; persistence is owned by host rule memory, and matching requests are answered without asking again.
+- A one-time grant is never upgraded to a persistent denial: a host rejection maps to `reject_once`, never to `reject_always`.
+- The approval tool name now carries the command kind (e.g. `execute (cat)`), so "allow for this session" covers that kind instead of every executed command.
+- Upgrade note: bare `execute` tool grants remembered before this release no longer match; those requests ask once more (a tightening, not a loosening).
+
 ## 0.2.1-rc.2.4
 
 ### 中文

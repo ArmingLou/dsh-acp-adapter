@@ -32,6 +32,7 @@ const en = {
   acpTool: 'ACP tool',
   allowOnce: 'Allow once',
   rejectOnce: 'Reject once',
+  optionsOffered: 'Options the Agent offered',
   delegatedPermissionUnavailable:
     'The host does not yet support these authorization options for child sessions; no permission was granted.',
   delegatedQuestionUnavailable: 'The host does not yet support questions for child sessions; no answer was submitted.',
@@ -70,6 +71,7 @@ const zh: typeof en = {
   acpTool: 'ACP 工具',
   allowOnce: '本次允许',
   rejectOnce: '本次拒绝',
+  optionsOffered: 'Agent 提供的选项',
   delegatedPermissionUnavailable: '宿主暂不支持子会话的此类授权选项；本次未授权。',
   delegatedQuestionUnavailable: '宿主暂不支持子会话的此类问答；本次未提交答案。',
 }

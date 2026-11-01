@@ -21,6 +21,8 @@ import {
 export type { AcpApprovalOutcome } from './events.ts'
 export const ACP_PERMISSION_OPTIONS_MAX = 128
 export const ACP_PERMISSION_ID_MAX_BYTES = 512
+/** Upper bound for the program token appended to an execute tool name. */
+export const ACP_PERMISSION_TOOL_TOKEN_MAX = 24
 
 const dshTeamPresentation = Symbol('dsh-team-permission-presentation')
 interface DshTeamPermissionPresentation {
@@ -119,6 +121,50 @@ const commandKeys = ['command', 'cmd', 'CommandLine', 'argv'] as const
 function commandOf(tool: acp.RequestPermissionRequest['toolCall']): string | undefined {
   if (typeof tool.rawInput === 'string') return tool.rawInput
   return firstString(recordValue(tool.rawInput), commandKeys)
+}
+/**
+ * The program an execute command runs, reduced to a token a Host can carry as a
+ * tool name. Everything outside `[A-Za-z0-9._-]` is dropped and the result is
+ * bounded, so neither a whole command nor a terminal control sequence can reach
+ * a name the user later persists as a grant.
+ */
+function executeProgramToken(command: string): string | undefined {
+  const first = command.trim().split(/\s+/)[0]
+  if (first === undefined) return undefined
+  // A quoted program (`'my-tool' --flag`) is still a name; a path prefix says
+  // where the binary lives, not which operation the user is approving.
+  const program =
+    first
+      .replace(/^['"`]+/, '')
+      .replace(/['"`]+$/, '')
+      .split(/[\\/]/)
+      .pop() ?? ''
+  const token = program.replace(/[^A-Za-z0-9._-]+/g, '').slice(0, ACP_PERMISSION_TOOL_TOKEN_MAX)
+  // `..`, `&&` and `-` name no program; they must not become a grant that any
+  // later command plausibly shares.
+  return /[A-Za-z0-9]/.test(token) ? token : undefined
+}
+/**
+ * The tool name an ACP permission request carries into Host approval.
+ *
+ * ACP requests usually have no `name`, only `kind: 'execute'`, so a bare kind
+ * made every execute request share one name — and a Host that remembers the
+ * granted name then covered every command of the session. Naming the program
+ * (`execute (git)`) narrows that grant to the same kind of command only.
+ *
+ * `execute` alone stays the fallback whenever no program can be read. That is
+ * also exactly the case where the Host has no command text to judge, so its
+ * execute detection must keep matching a bare slug instead of a narrowed name.
+ * A declared `name` and every non-execute kind are passed through verbatim.
+ */
+export function permissionToolName(tool: acp.RequestPermissionRequest['toolCall'], copy: PermissionCopy): string {
+  if (typeof tool.name === 'string') return tool.name
+  const kind = tool.kind
+  if (kind === undefined || kind === null) return copy.acpTool
+  if (kind !== 'execute') return kind
+  const command = commandOf(tool)
+  const token = command === undefined ? undefined : executeProgramToken(command)
+  return token === undefined ? kind : `${kind} (${token})`
 }
 function markdownCodeBlock(value: string): string {
   let longestFence = 0
@@ -321,16 +367,38 @@ function optionLabels(options: readonly acp.PermissionOption[], copy: Permission
   return new Set(labels).size === labels.length ? labels : labels.map((label, index) => `${index + 1}. ${label}`)
 }
 
+/** One grant the native approval card can express, with its one-time refusal when offered. */
+interface ApprovalChoice {
+  readonly allow: acp.PermissionOption
+  readonly reject?: acp.PermissionOption
+}
+
 /** The native binary card must not discard an offered decision or authorization scope. */
-function binaryApprovalOptions(options: readonly acp.PermissionOption[]):
-  | {
-      allow: acp.PermissionOption
-      reject?: acp.PermissionOption
-    }
-  | undefined {
+function binaryApprovalOptions(options: readonly acp.PermissionOption[]): ApprovalChoice | undefined {
   const allows = options.filter((option) => option.kind === 'allow_once')
   const rejects = options.filter((option) => option.kind === 'reject_once')
   if (allows.length !== 1 || rejects.length > 1 || options.length !== allows.length + rejects.length) return undefined
+  const names = options.map((option) => visibleCommand(option.name).trim())
+  if (names.some((name) => name === '') || new Set(names).size !== names.length) return undefined
+  return { allow: allows[0]!, ...(rejects[0] === undefined ? {} : { reject: rejects[0] }) }
+}
+
+/**
+ * One one-time grant offered beside `allow_always`. The native approval card
+ * already owns "allow once / allow for this session / allow for this project /
+ * reject", so the Agent's persistent copy is not a decision the card drops; the
+ * one-time grant it returns still grants exactly once. Shapes the card cannot
+ * keep faithful stay on the question surface — a second one-time grant or
+ * refusal (another scope under the same one-shot authority), and
+ * `reject_always`, because a one-time refusal must never be upgraded to a
+ * persistent Agent-side denial.
+ */
+function persistentApprovalOptions(options: readonly acp.PermissionOption[]): ApprovalChoice | undefined {
+  const allows = options.filter((option) => option.kind === 'allow_once')
+  const rejects = options.filter((option) => option.kind === 'reject_once')
+  const persistent = options.filter((option) => option.kind === 'allow_always')
+  if (allows.length !== 1 || rejects.length > 1 || persistent.length === 0) return undefined
+  if (options.length !== allows.length + rejects.length + persistent.length) return undefined
   const names = options.map((option) => visibleCommand(option.name).trim())
   if (names.some((name) => name === '') || new Set(names).size !== names.length) return undefined
   return { allow: allows[0]!, ...(rejects[0] === undefined ? {} : { reject: rejects[0] }) }
@@ -396,6 +464,8 @@ export function createAcpNativePermissionHandler(
     const agent = deps.getAgent()
     if (agent === undefined) return decide({ outcome: 'cancelled', note: 'agent-unavailable' })
     const binary = binaryApprovalOptions(params.options)
+    const persistent = binary === undefined ? persistentApprovalOptions(params.options) : undefined
+    const choice = binary ?? persistent
     const nativeInteractionCall =
       deps.nativeQuestionProfile === 'antigravity' && isAntigravityInteractionCall(params.toolCall)
     const nativeInteractionQuestion =
@@ -403,33 +473,42 @@ export function createAcpNativePermissionHandler(
       params.options.length > 0 &&
       params.options.every((option) => option.kind === 'allow_once')
 
-    if (!nativeInteractionQuestion && deps.approval !== undefined && binary !== undefined) {
+    if (!nativeInteractionQuestion && deps.approval !== undefined && choice !== undefined) {
       try {
         const commandLine = params.toolCall.kind === 'execute' ? commandOf(params.toolCall) : undefined
         const outcome = await deps.approval.request({
           agent,
-          toolName: params.toolCall.name ?? params.toolCall.kind ?? copy.acpTool,
+          toolName: permissionToolName(params.toolCall, copy),
           callId: params.toolCall.toolCallId,
           ...(params.toolCall.rawInput === undefined ? {} : { toolArgs: params.toolCall.rawInput }),
           ...(commandLine === undefined ? {} : { commandLine }),
           reason: [
             nativePermissionReason(params.toolCall, copy),
-            `${copy.allowOnce}: ${visibleCommand(binary.allow.name)}`,
-            ...(binary.reject === undefined ? [] : [`${copy.rejectOnce}: ${visibleCommand(binary.reject.name)}`]),
+            `${copy.allowOnce}: ${visibleCommand(choice.allow.name)}`,
+            ...(choice.reject === undefined ? [] : [`${copy.rejectOnce}: ${visibleCommand(choice.reject.name)}`]),
+            // A wider card replaces the Agent's persistent tiers with the Host's
+            // own, so every name it would have offered stays readable here.
+            ...(persistent === undefined
+              ? []
+              : [
+                  `${copy.optionsOffered}: ${params.options
+                    .map((option) => visibleCommand(option.name).trim())
+                    .join(' / ')}`,
+                ]),
           ].join('\n'),
           ...(signal === undefined ? {} : { signal }),
         })
-        if (outcome === 'allowed-once')
+        const selected = outcome === 'allowed-once' ? choice.allow : outcome === 'rejected' ? choice.reject : undefined
+        if (selected !== undefined)
           return decide(
-            { outcome: 'selected', optionId: binary.allow.optionId, selectedOptionKind: binary.allow.kind },
+            { outcome: 'selected', optionId: selected.optionId, selectedOptionKind: selected.kind },
             'native-approval',
           )
-        if (outcome === 'rejected' && binary.reject !== undefined)
-          return decide(
-            { outcome: 'selected', optionId: binary.reject.optionId, selectedOptionKind: binary.reject.kind },
-            'native-approval',
-          )
-        return decide({ outcome: 'cancelled', note: outcome }, 'native-approval')
+        // A Host without an answerer cannot decide the wider card either; keep
+        // the Agent's complete choice list on the question surface instead of
+        // dropping the request. Binary cards keep their unchanged closed outcome.
+        if (persistent === undefined || outcome !== 'unavailable')
+          return decide({ outcome: 'cancelled', note: outcome }, 'native-approval')
       } catch (error: unknown) {
         deps.log?.(`dsh-acp native approval unavailable: ${errorMessage(error)}`)
         // Continue to the generic native question only when it is available;

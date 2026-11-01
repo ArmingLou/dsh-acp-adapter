@@ -240,10 +240,6 @@ describe('complete ACP permission choices', () => {
 
   it.each([
     {
-      name: 'once and persistent grants',
-      options: [option('once', 'Allow once', 'allow_once'), option('session', 'Allow this session', 'allow_always')],
-    },
-    {
       name: 'distinct one-time grants',
       options: [
         option('turn', 'Allow this turn', 'allow_once'),
@@ -308,9 +304,10 @@ describe('complete ACP permission choices', () => {
       return { answers: [{ id: questions[0]!.id, selected: [second] }] }
     })
     const handler = createAcpNativePermissionHandler({ approval, userQuestions: { ask }, getAgent: () => ({}) })
+    // Two one-time grants keep this set on the question surface.
     await expect(
       handler({
-        ...request([option('turn', first, 'allow_once'), option('persistent', second, 'allow_always')]),
+        ...request([option('turn', first, 'allow_once'), option('persistent', second, 'allow_once')]),
         toolCall: {
           toolCallId: 'additional-scope',
           title: 'Additional sandbox permissions',
@@ -344,7 +341,8 @@ describe('complete ACP permission choices', () => {
     }))
     const handler = createAcpNativePermissionHandler({ approval, userQuestions: { ask }, getAgent: () => ({}) })
     const options = [option('once', 'Allow once', 'allow_once')]
-    if (surface === 'native-question') options.push(option('session', 'Allow for this session', 'allow_always'))
+    // A second one-time grant keeps this set on the question surface.
+    if (surface === 'native-question') options.push(option('strict', 'Allow with strict review', 'allow_once'))
     await expect(
       handler({
         ...request(options),
@@ -468,7 +466,10 @@ describe('complete ACP permission choices', () => {
       })
       await expect(
         handler(
-          request([option('once', 'Allow once', 'allow_once'), option('always', 'Always allow', 'allow_always')]),
+          request([
+            option('once', 'Allow once', 'allow_once'),
+            option('strict', 'Allow with strict review', 'allow_once'),
+          ]),
         ),
       ).resolves.toEqual({ outcome: { outcome: 'cancelled' } })
       expect(approval.request).not.toHaveBeenCalled()
